@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Load Guard</title>
+<title>load guard</title>
 <meta name="color-scheme" content="dark light">
 <link rel="icon" id="favicon" href="data:,">
 <link rel="preload" href="fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
@@ -75,8 +75,8 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; fill: no
 /* header */
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; }
 .brand { display: flex; align-items: center; gap: 10px; }
-.brand svg { width: 26px; height: 26px; color: var(--ink); }
-h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -.015em; }
+.brand svg { width: 28px; height: 28px; }
+h1 { font-size: 19px; margin: 0; font-weight: 680; letter-spacing: -.02em; }
 .host { color: var(--muted); padding: 1px 9px; border: 1px solid var(--border2); border-radius: 20px; font-size: var(--fs-xs); font-weight: 500; }
 .right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .conn { display: flex; align-items: center; gap: 7px; color: var(--ink2); font-size: var(--fs-sm); font-weight: 500; }
@@ -247,8 +247,8 @@ footer { color: var(--muted); font-size: var(--fs-xs); padding: 4px 2px 0; line-
 <main>
   <header>
     <div class="brand">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7.500 3v5.500c0 4.600-3.200 8-7.500 9.500-4.300-1.500-7.500-4.900-7.500-9.500V6z"/><path d="M8 12.500h2l1.500-3 2 5.500 1.500-2.500h1"/></svg>
-      <h1>Load Guard</h1>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="lg-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4a95ee"/><stop offset="1" stop-color="#2a78d6"/></linearGradient></defs><path d="M12 2.6 19.6 5.6V11.3C19.6 16 16.4 19.5 12 21.1 7.6 19.5 4.4 16 4.4 11.3V5.6Z" fill="url(#lg-g)" stroke="url(#lg-g)" stroke-width="1.6" stroke-linejoin="round"/><path d="M7.6 12.3H9.9L11.4 9.2 13.4 14.9 14.9 12.3H16.4" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <h1>load guard</h1>
     </div>
     <span class="host" id="host" hidden></span>
     <div class="right">
@@ -630,7 +630,7 @@ function render(s) {
   $('hero').dataset.state = state; $('hero-title').textContent = title; $('hero-sub').textContent = sub;
   $('hero-icon').replaceChildren(icon({ ok: 'check', wait: 'warn', crit: 'cross' }[state]));
   setFavicon({ ok: '#0ca30c', wait: '#fab219', crit: '#d03b3b' }[state]);
-  document.title = (state === 'ok' ? '' : state === 'wait' ? 'WAIT · ' : 'CRITICAL · ') + 'Load Guard · ' + s.host;
+  document.title = (state === 'ok' ? '' : state === 'wait' ? 'WAIT · ' : 'CRITICAL · ') + 'load guard · ' + s.host;
   $('cap-w-n').textContent = nw + ' / ' + L.max_workers; pips($('cap-w'), Math.max(L.max_workers, nw), nw, 0);
   $('cap-w-s').textContent = qw.length ? qw.length + ' in the queue' : pl(seats, 'seat') + ' free';
   $('cap-h-n').textContent = (heavy + runners) + ' / ' + L.max_heavy_total; pips($('cap-h'), Math.max(L.max_heavy_total, heavy + runners), heavy, runners);
