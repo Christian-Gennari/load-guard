@@ -7,6 +7,8 @@ description: Keep this machine from running out of memory or CPU when several ag
 
 Parallel agents that each start a full build or test run can push a shared machine into swap or the out-of-memory killer. This skill keeps parallel work inside a budget.
 
+This skill works in any agent harness that can run shell commands (Claude Code, Codex, Gemini CLI, Cursor, OpenCode, …). "Worker" below means any parallel agent you start: a subagent, a background CLI agent, a delegated task.
+
 Tool: `lg` (on PATH via `~/.local/bin/lg`; otherwise `bin/lg` in this skill's folder). State and lock files are in `~/.cache/load-guard/`, shared by every session of the user on the machine, so the limits hold across sessions.
 
 **Machine notes:** if `~/.config/load-guard.notes.md` exists, read it first. It holds what was measured on this machine (peak memory and duration of its builds and test suites, other services, CI runners). Add new measurements there, not here.
@@ -24,6 +26,7 @@ Tool: `lg` (on PATH via `~/.local/bin/lg`; otherwise `bin/lg` in this skill's fo
 | `lg dashboard` (`--install [--tailscale]`, `--uninstall`, `--url`, `--demo`) | Live web page for the user (default `http://127.0.0.1:8377/`). Give the user `lg dashboard --url` when they ask how busy the machine is. |
 | `lg events` (`-f`, `N`) | Event log: job start/end, worker start/end, watchdog actions. |
 | `lg config` | Effective limits. |
+| `lg rules` | The short load rules for an instruction file (AGENTS.md, CLAUDE.md, GEMINI.md). |
 
 Defaults come from the machine (memory and core count) and can be changed in `~/.config/load-guard.conf` (see `config.example.conf`), not in the script. Run `lg config` to see them.
 

@@ -5,7 +5,7 @@
 # https://github.com/Christian-Gennari/load-guard · MIT license
 # Config: ~/.config/load-guard.conf (shell KEY=VALUE lines, see config.example.conf).
 set -uo pipefail
-LG_VERSION=1.0.0
+LG_VERSION=1.1.0
 
 CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
 # shellcheck disable=SC1090
@@ -342,6 +342,7 @@ case ${1:-status} in
   dashboard) shift; cmd_dashboard "$@";;
   config)   for v in ${!LG_@}; do echo "$v=${!v}"; done;;
   version|--version) echo "lg $LG_VERSION";;
-  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] | worker start|end|touch|list <name> | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | config | version";;
+  rules)    cat "$(dirname "$(dirname "$(readlink -f "$0")")")/rules/load-guard-rules.md";;
+  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] | worker start|end|touch|list <name> | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
   *) say "unknown command: $1 (lg help)"; exit 2;;
 esac

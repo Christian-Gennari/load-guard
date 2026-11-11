@@ -10,7 +10,7 @@ load guard is a small Bash tool, `lg`, plus an optional live dashboard:
 - **Slots and hard limits for heavy commands** – `lg run -- npm test` waits for a free machine-wide slot and enough free memory, then runs the command in its own systemd scope with a memory limit, a swap limit, a CPU quota and a lower priority.
 - **Memory watchdog** – when free memory gets critically low, it stops the newest `lg run` job (only those) and tells the caller to retry later (exit code 75).
 - **Live dashboard** – one page that shows if there is room for more work, what runs now, what waits and why, and how the last 24 hours went.
-- **Agent skill** – `SKILL.md` teaches the agent to use all of this when it fans out work (Claude Code, and other harnesses that read the [Agent Skills](https://agentskills.io) format; see [Other agent harnesses](#other-agent-harnesses)).
+- **Works with any agent harness** – `lg` is a plain shell command. The included [Agent Skills](https://agentskills.io) skill (`SKILL.md`) is linked where Claude Code, Codex, Gemini CLI, Cursor and OpenCode find it, and `--rules` adds short load rules to their global instruction files, so every agent and worker follows them.
 
 Everything is per user, shared by all sessions of that user on the machine, so the limits hold across terminals and agents. No root, no daemon besides two small user services, no dependencies outside a standard Linux install.
 
@@ -31,27 +31,32 @@ Everything is per user, shared by all sessions of that user on the machine, so t
 
 ## Install
 
-As a Claude Code skill (other harnesses: see [below](#other-agent-harnesses)):
-
 ```bash
-git clone https://github.com/Christian-Gennari/load-guard ~/.claude/skills/load-guard
-~/.claude/skills/load-guard/install.sh
+git clone https://github.com/Christian-Gennari/load-guard ~/.local/share/load-guard
+~/.local/share/load-guard/install.sh --rules
 ```
 
-Without Claude Code, clone it anywhere and run `./install.sh` in it.
+You can clone it anywhere (for example `~/.claude/skills/load-guard` if you use only Claude Code). The installer:
 
-The installer checks the requirements, links `lg` into `~/.local/bin`, creates `~/.config/load-guard.conf` (all lines commented, so the defaults apply), and starts two user services: the watchdog and the dashboard on <http://127.0.0.1:8377/>.
+1. checks the requirements,
+2. links `lg` into `~/.local/bin` (agents need it on PATH),
+3. creates `~/.config/load-guard.conf` (all lines commented, so the defaults apply),
+4. links the skill into the shared skill folders of your agent harnesses (see [Agent harnesses](#agent-harnesses)),
+5. with `--rules`, adds the load rules to the global instruction file of each harness it finds,
+6. starts two user services: the watchdog, and the dashboard on <http://127.0.0.1:8377/>.
 
 | Option | Effect |
 |---|---|
+| `--rules` | Add the load rules to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and `~/.config/opencode/AGENTS.md` (only for harnesses that are installed). Recommended. |
 | `--tailscale` | Also publish the dashboard to your tailnet over HTTPS with `tailscale serve` (not to the public internet). |
 | `--no-dashboard` | Install the watchdog only. |
-| `--no-services` | Only put `lg` on PATH. |
-| `--uninstall` | Stop and remove the services and the PATH link. |
+| `--no-services` | No systemd user services. |
+| `--no-skill-links` | Do not link the skill into the harness skill folders (and skip `--rules`). |
+| `--uninstall` | Remove what the installer added: services, skill links, the rules blocks and the PATH link. Your config and state stay. |
 
 User services stop when you log out. On a server, run `sudo loginctl enable-linger $USER` once so they keep running.
 
-To update: `git -C ~/.claude/skills/load-guard pull`, then `systemctl --user restart load-guard-watchdog load-guard-dashboard`.
+To update: `git -C <folder> pull`, then `<folder>/install.sh --rules` again (it is safe to run more than once) and `systemctl --user restart load-guard-watchdog load-guard-dashboard`.
 
 **Try the dashboard first, without installing:** `python3 dashboard/server.py --demo` and open <http://127.0.0.1:8377/>. It shows synthetic data.
 
@@ -70,27 +75,32 @@ lg dashboard --url                 # where the dashboard is
 
 Exit code **75** from `lg run` means the job was stopped by the watchdog, or waited too long in the queue: wait a moment and run it again.
 
-In Claude Code, say "use the load guard" or just start parallel work: the skill tells Claude to check `lg admit` before each new worker, to register workers, and to give every worker a short brief that makes it run builds and tests through `lg run`.
+In your agent, say "use the load guard", or just start parallel work: the skill tells the agent to check `lg admit` before each new worker, to register workers, and to give every worker a short brief that makes it run builds and tests through `lg run`. `lg rules` prints the short rules text.
 
-## Other agent harnesses
+## Agent harnesses
 
-`lg` and the dashboard do not depend on Claude Code. Any agent that can run a shell command can use them, and the limits are the same for all of them: Claude Code, Codex, OpenCode, Cursor, Gemini CLI or your own scripts can share one machine.
+`lg` and the dashboard do not depend on one harness: any agent that can run a shell command can use them, and all agents of a user share the same limits. So Claude Code, Codex, Gemini CLI, Cursor, OpenCode and your own scripts can work on one machine at the same time.
 
-`SKILL.md` follows the open [Agent Skills](https://agentskills.io) format, which several harnesses read. Each harness looks in its own skills folder (for example `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/` or `.cursor/skills/`; check the documentation of your tool). Keep one clone and link it into the folder your harness reads:
+There are two ways an agent learns about load guard, and the installer sets up both:
 
-```bash
-mkdir -p ~/.agents/skills && ln -s ~/.claude/skills/load-guard ~/.agents/skills/load-guard
-```
+**The skill** (`SKILL.md`, the open [Agent Skills](https://agentskills.io) format). The agent loads it when it is relevant, for example before it fans out work. The installer links this folder into the two shared skill folders:
 
-For a harness without skills, add the rules to its instructions file (for example `AGENTS.md`):
+| Folder | Read by |
+|---|---|
+| `~/.agents/skills/` | Codex, Gemini CLI, Cursor, OpenCode |
+| `~/.claude/skills/` | Claude Code, Cursor, OpenCode |
 
-```markdown
-## Machine load
-This machine is shared with other agents. Run every build, test or Playwright command as
-`lg run -- <command>`. If it prints "queued", wait. Exit code 75 means it was stopped for low
-memory: wait 2 minutes and run it again. Before you start parallel workers, run `lg admit`
-and start a worker only on ADMIT. Run the narrowest test target; never leave watchers running.
-```
+**The rules** (`rules/load-guard-rules.md`, about ten lines). A skill loads only when the agent decides it is relevant, so a worker that was told only "fix this test" may never load it. The rules are always in context: run builds and tests through `lg run`, wait when queued, rerun after exit 75, check `lg admit` before parallel workers. With `--rules`, the installer adds them as a marked block (`<!-- load-guard:begin … -->`) to:
+
+| Harness | Global instruction file |
+|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` (or `$CODEX_HOME/AGENTS.md`) |
+| Gemini CLI | `~/.gemini/GEMINI.md` |
+| OpenCode | `~/.config/opencode/AGENTS.md` if it exists; else OpenCode reads `~/.claude/CLAUDE.md`, so the installer does not create its own file (that would hide your Claude rules from OpenCode) |
+| Cursor | user rules are in Settings › Rules: paste the output of `lg rules` there |
+
+Running the installer again replaces the block; `--uninstall` removes it and leaves the rest of each file as it was. For any other tool, put the output of `lg rules` into its instruction file or project `AGENTS.md`. The rules say to ignore them when `lg` is not installed, so they are safe in dotfiles that you share between machines.
 
 ## Configuration
 
