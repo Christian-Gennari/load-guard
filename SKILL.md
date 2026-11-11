@@ -48,7 +48,7 @@ Limits of the design: only commands that go through `lg run` get hard cgroup lim
 Machine load rules (this machine is shared):
 - Run every build, test, lint-with-typecheck or Playwright command through the load guard:
   lg run -- <command>      (example: lg run -- npm test -- --include src/app/foo)
-  If lg is not on PATH, use ~/.claude/skills/load-guard/bin/lg.
+  If lg is not on PATH, use bin/lg in the load-guard skill folder (for example ~/.claude/skills/load-guard/bin/lg).
 - Run the narrowest test target that proves your change (one test file, class or package).
   Run each full suite at most once, at the end, and only when your change needs it.
 - Use few parallel test workers (for example Playwright --workers=1, dotnet build -m:2, pytest -n 2).

@@ -10,7 +10,7 @@ load guard is a small Bash tool, `lg`, plus an optional live dashboard:
 - **Slots and hard limits for heavy commands** – `lg run -- npm test` waits for a free machine-wide slot and enough free memory, then runs the command in its own systemd scope with a memory limit, a swap limit, a CPU quota and a lower priority.
 - **Memory watchdog** – when free memory gets critically low, it stops the newest `lg run` job (only those) and tells the caller to retry later (exit code 75).
 - **Live dashboard** – one page that shows if there is room for more work, what runs now, what waits and why, and how the last 24 hours went.
-- **Claude Code skill** – `SKILL.md` teaches Claude to use all of this when it fans out work.
+- **Agent skill** – `SKILL.md` teaches the agent to use all of this when it fans out work (Claude Code, and other harnesses that read the [Agent Skills](https://agentskills.io) format; see [Other agent harnesses](#other-agent-harnesses)).
 
 Everything is per user, shared by all sessions of that user on the machine, so the limits hold across terminals and agents. No root, no daemon besides two small user services, no dependencies outside a standard Linux install.
 
@@ -31,7 +31,7 @@ Everything is per user, shared by all sessions of that user on the machine, so t
 
 ## Install
 
-As a Claude Code skill (recommended):
+As a Claude Code skill (other harnesses: see [below](#other-agent-harnesses)):
 
 ```bash
 git clone https://github.com/Christian-Gennari/load-guard ~/.claude/skills/load-guard
@@ -71,6 +71,26 @@ lg dashboard --url                 # where the dashboard is
 Exit code **75** from `lg run` means the job was stopped by the watchdog, or waited too long in the queue: wait a moment and run it again.
 
 In Claude Code, say "use the load guard" or just start parallel work: the skill tells Claude to check `lg admit` before each new worker, to register workers, and to give every worker a short brief that makes it run builds and tests through `lg run`.
+
+## Other agent harnesses
+
+`lg` and the dashboard do not depend on Claude Code. Any agent that can run a shell command can use them, and the limits are the same for all of them: Claude Code, Codex, OpenCode, Cursor, Gemini CLI or your own scripts can share one machine.
+
+`SKILL.md` follows the open [Agent Skills](https://agentskills.io) format, which several harnesses read. Each harness looks in its own skills folder (for example `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/` or `.cursor/skills/`; check the documentation of your tool). Keep one clone and link it into the folder your harness reads:
+
+```bash
+mkdir -p ~/.agents/skills && ln -s ~/.claude/skills/load-guard ~/.agents/skills/load-guard
+```
+
+For a harness without skills, add the rules to its instructions file (for example `AGENTS.md`):
+
+```markdown
+## Machine load
+This machine is shared with other agents. Run every build, test or Playwright command as
+`lg run -- <command>`. If it prints "queued", wait. Exit code 75 means it was stopped for low
+memory: wait 2 minutes and run it again. Before you start parallel workers, run `lg admit`
+and start a worker only on ADMIT. Run the narrowest test target; never leave watchers running.
+```
 
 ## Configuration
 
