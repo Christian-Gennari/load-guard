@@ -2,6 +2,10 @@
 # Install load guard for the current user: puts `lg` on PATH, makes the skill visible to your
 # agent harnesses, and starts the user services.
 #
+#   curl -fsSL https://raw.githubusercontent.com/Christian-Gennari/load-guard/main/install.sh | bash -s -- --rules
+#                                 one-line install or update: gets the repository (LG_DIR, default
+#                                 ~/.local/share/load-guard, or the folder of an existing install), then runs
+#                                 the installer from there with the same options
 #   ./install.sh                  lg on PATH + skill links + watchdog + dashboard on http://127.0.0.1:8377/
 #   ./install.sh --rules          ... and add the load rules to the global instruction file of each
 #                                 agent harness found (Claude Code, Codex, Gemini CLI, OpenCode)
@@ -11,6 +15,31 @@
 #   ./install.sh --no-skill-links do not link the skill into ~/.agents/skills and ~/.claude/skills
 #   ./install.sh --uninstall      remove what this installer added (keeps this folder, the state and the config)
 set -euo pipefail
+
+# ---- one-line install: piped into bash, this script has no folder of its own.
+# Get the repository (or update the existing install), then run the installer from there.
+LG_REPO="${LG_REPO:-https://github.com/Christian-Gennari/load-guard}"
+LG_REF="${LG_REF:-main}"
+bootstrap() {
+  local dir="${LG_DIR:-}" cur
+  if [[ -z $dir ]]; then
+    cur=$(readlink -f "${LG_BIN_DIR:-$HOME/.local/bin}/lg" 2>/dev/null || true)
+    if [[ $cur == */bin/lg && -f ${cur%/bin/lg}/install.sh ]]; then dir=${cur%/bin/lg}; else dir="$HOME/.local/share/load-guard"; fi
+  fi
+  echo "load guard: $LG_REPO ($LG_REF) -> ${dir/#$HOME/\~}"
+  if [[ -d $dir/.git ]]; then
+    git -C "$dir" pull -q --ff-only || echo "  ! could not update $dir (local changes?): installing it as it is"
+  elif [[ -e $dir && -n $(ls -A "$dir" 2>/dev/null) ]]; then
+    echo "  ✗ $dir exists and is not a git clone: set LG_DIR to another folder" >&2; exit 1
+  elif command -v git >/dev/null; then
+    git clone -q --depth 1 --branch "$LG_REF" "$LG_REPO" "$dir"
+  else
+    mkdir -p "$dir"; curl -fsSL "$LG_REPO/archive/$LG_REF.tar.gz" | tar -xz -C "$dir" --strip-components=1
+  fi
+  exec bash "$dir/install.sh" "$@" </dev/null
+}
+_self="${BASH_SOURCE[0]:-}"
+if [[ -z $_self || ! -f $_self || ! -f $(dirname "$_self")/bin/lg ]]; then bootstrap "$@"; fi
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN="${LG_BIN_DIR:-$HOME/.local/bin}"
@@ -24,7 +53,7 @@ for a in "$@"; do
     --rules) rules=1;;
     --tailscale) tailscale=--tailscale;;
     --uninstall) uninstall=1;;
-    -h|--help) sed -n '2,14p' "$0" | cut -c3-; exit 0;;
+    -h|--help) sed -n '2,18p' "$0" | cut -c3-; exit 0;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2;;
   esac
 done
@@ -154,7 +183,7 @@ fi
 
 if (( services )); then
   echo; echo "Services"
-  "$HERE/bin/lg" watchdog --install >/dev/null && ok "watchdog service (load-guard-watchdog)"
+  "$HERE/bin/lg" watchdog --install >/dev/null && systemctl --user restart load-guard-watchdog.service && ok "watchdog service (load-guard-watchdog)"
   if (( dashboard )); then
     url=$("$HERE/bin/lg" dashboard --install $tailscale | sed -n 's/^dashboard: //p')
     ok "dashboard service (load-guard-dashboard): ${url:-see lg dashboard --url}"

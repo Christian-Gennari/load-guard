@@ -32,11 +32,17 @@ Everything is per user, shared by all sessions of that user on the machine, so t
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Christian-Gennari/load-guard/main/install.sh | bash -s -- --rules
+```
+
+This clones the repository to `~/.local/share/load-guard` and runs its installer with the options after `--`. To read the script first, or to choose the folder, clone it yourself:
+
+```bash
 git clone https://github.com/Christian-Gennari/load-guard ~/.local/share/load-guard
 ~/.local/share/load-guard/install.sh --rules
 ```
 
-You can clone it anywhere (for example `~/.claude/skills/load-guard` if you use only Claude Code). The installer:
+You can clone it anywhere (for example `~/.claude/skills/load-guard` if you use only Claude Code). With the one-line command, set `LG_DIR=<folder>` to choose the folder. The installer:
 
 1. checks the requirements,
 2. links `lg` into `~/.local/bin` (agents need it on PATH),
@@ -56,7 +62,7 @@ You can clone it anywhere (for example `~/.claude/skills/load-guard` if you use 
 
 User services stop when you log out. On a server, run `sudo loginctl enable-linger $USER` once so they keep running.
 
-To update: `git -C <folder> pull`, then `<folder>/install.sh --rules` again (it is safe to run more than once) and `systemctl --user restart load-guard-watchdog load-guard-dashboard`.
+To update, run the same one-line command again. It finds the existing install (through `~/.local/bin/lg`), pulls the new version, puts the rules block up to date and restarts the services. From a clone: `git pull && ./install.sh --rules`.
 
 **Try the dashboard first, without installing:** `python3 dashboard/server.py --demo` and open <http://127.0.0.1:8377/>. It shows synthetic data.
 
