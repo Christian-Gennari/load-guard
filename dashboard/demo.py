@@ -45,7 +45,7 @@ def sample():
                      "cores": round(2.6 + 0.9 * wave(t, 13, int(slot)), 2)})
     workers = [{"name": "api-refactor", "task": "Move the payments API to the new client", "since": int(T0 - 2900), "stale": False},
                {"name": "docs-update", "task": "Update the setup guide for the new CLI flags", "since": int(T0 - 610), "stale": False}]
-    queue = [{"pid": 1, "since": int(T0 - 18), "kind": "heavy", "why": "all 2 heavy slots busy",
+    queue = [{"pid": 1, "since": int(T0 - 18), "kind": "heavy", "why": "all 2 build and test slots are in use",
               "cwd": "~/code/webapp/backend", "cmd": "dotnet build -m:2"}]
     top = [("node", 2.9, 24), ("dotnet", 2.2, 3), ("chrome", 1.4, 18), ("python3", 0.9, 9),
            ("postgres", 0.6, 12), ("code", 0.5, 7), ("dockerd", 0.2, 1), ("redis-server", 0.1, 1)]
@@ -58,7 +58,7 @@ def sample():
         "swap_rate": round(max(0, .3 * wave(t, 45)), 2),
         "lg": {"free_gb": round(f, 1), "heavy": 2, "max_heavy": 2, "workers": 2, "max_workers": 3, "runners": 0,
                "max_heavy_total": 3, "admit_worker": True, "worker_wait": "", "admit_heavy": False,
-               "heavy_wait": "all 2 heavy slots busy"},
+               "heavy_wait": "all 2 build and test slots are in use"},
         "watchdog": True, "limits": LIMITS, "jobs": jobs, "queue": queue, "workers": workers,
         "top": [{"name": n, "rss": int(g * GB), "count": c} for n, g, c in top],
     }
@@ -103,7 +103,8 @@ def log_lines():
     ts = lambda x: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(x))
     lines += [f"{ts(T0 - 2905)} admit ADMIT for=api-refactor",
               f"{ts(T0 - 2900)} worker start api-refactor task=Move the payments API to the new client",
-              f"{ts(T0 - 1500)} admit WAIT for=ui-tests why=free memory 3.6 GB < 4 GB",
+              f"{ts(T0 - 1500)} admit WAIT for=ui-tests why=memory is low: 3.6 GB free, a new worker needs 4 GB",
+              f"{ts(T0 - 900)} admit OVERRIDE for=hotfix-login reason=Production login is down; the fix is one small test was=all 3 worker seats are taken (api-refactor, ui-tests, lint)",
               f"{ts(T0 - 615)} admit ADMIT for=docs-update",
               f"{ts(T0 - 610)} worker start docs-update task=Update the setup guide for the new CLI flags",
               f"{ts(T0 - 95)} start lg-demo-1 slot=1 cwd=~/code/webapp/frontend cmd={COMMANDS[0][0]}",

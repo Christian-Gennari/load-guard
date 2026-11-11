@@ -18,8 +18,8 @@ Tool: `lg` (on PATH via `~/.local/bin/lg`; otherwise `bin/lg` in this skill's fo
 | Command | What it does |
 |---|---|
 | `lg status` (`--json`) | Free memory, swap, load, memory pressure, heavy jobs, workers, ADMIT/WAIT for a new worker and for a new heavy job (with the reasons), watchdog state, dashboard URL. |
-| `lg admit` | Exit 0 and `ADMIT` when a new worker may start; else exit 1 and `WAIT: <reasons>`. `--wait` blocks and re-checks every 30 s (max 90 min, then exit 75). |
-| `lg worker start <name>` / `end <name>` / `touch` / `list` | Register a running worker. Registrations older than 8 h are ignored. |
+| `lg admit [--for <name>] [--override "<reason>"]` | Exit 0 and `ADMIT` when a new worker may start; else exit 1 and `WAIT: <plain reasons>`. The checks are fixed rules (free memory, load, memory pressure, worker seats), not a model. `--wait` blocks and re-checks every 30 s (max 90 min, then exit 75). Each decision appears in the dashboard's activity feed. |
+| `lg worker start <name> "<task>"` / `end <name>` / `touch` / `list` | Register a running worker with a one-line task; the dashboard shows it to the humans. Registrations older than 8 h are ignored. |
 | `lg run [--mem 3G] [--cpu 400%] -- <cmd…>` | Run a heavy command (tests, builds, Playwright). Waits for a free machine-wide slot and enough free memory, then runs it in its own systemd scope with MemoryMax, MemorySwapMax, CPUQuota and nice. Commands that match `LG_EXCLUSIVE_MATCH` run one at a time. Logs duration and peak memory per job. Exit 75 = stopped by the watchdog or queue timeout: wait and rerun. |
 | `lg watchdog` (`--install`) | Below `LG_KILL_FREE_GB` free memory, kills the newest `lg run` job (only those) and logs it. Also writes one metrics line per minute to `~/.cache/load-guard/metrics.log`. Installed as user service `load-guard-watchdog`. |
 | `lg report [hours]` | Min free memory, max swap/load/pressure, max parallel jobs/workers, watchdog actions, and per-job duration and peak memory. Use it to tune the limits. |
@@ -37,8 +37,9 @@ During a day of parallel work, check `lg report` now and then (the dashboard sho
 ## Orchestrator procedure
 
 1. Run `lg status`. If the watchdog is not running, run `lg watchdog --install`.
-2. Before each worker start, run `lg admit`. On `WAIT`, keep the task in your queue; do not start it. Re-check when a worker finishes or after a few minutes (a monitor or until-loop on `lg admit`, not a tight sleep loop). Start tasks in queue order.
-3. After the start, run `lg worker start <task-name>`. When the worker finishes, fails or is cancelled, run `lg worker end <task-name>`. Do this for workers of every kind (subagents, background CLI agents, delegated tasks).
+2. Before each worker start, run `lg admit --for <task-name>`. On `WAIT`, keep the task in your queue; do not start it. Re-check when a worker finishes or after a few minutes (a monitor or until-loop on `lg admit`, not a tight sleep loop). Start tasks in queue order.
+   Override a WAIT only for a real, stated reason (for example an urgent fix with a small job): `lg admit --for <name> --override "<reason>"`. The override and its reason appear in the dashboard, so people can see and judge it. Never override to save time on ordinary work.
+3. After the start, run `lg worker start <task-name> "<one-line task>"`. People watch the dashboard to see what you do, so write the task in plain words. When the worker finishes, fails or is cancelled, run `lg worker end <task-name>`. Do this for workers of every kind (subagents, background CLI agents, delegated tasks).
 4. Put the worker brief block below in every worker prompt that may build or test.
 5. For long runs, watch `lg events -f`, and run `lg report 2` from time to time, so you see watchdog stops. If a worker reports exit 75, tell it to wait and rerun, or lower `LG_MAX_WORKERS` if it repeats.
 6. Run your own heavy commands through `lg run` too.

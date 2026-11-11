@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>Run many coding agents on one Linux machine without running out of memory.</b></p>
+<p align="center"><b>A load-guard skill for AI agents, and a live window for the humans who watch them.</b></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2a78d6" alt="MIT license"></a>
@@ -13,15 +13,14 @@
   <a href="https://agentskills.io"><img src="https://img.shields.io/badge/Agent%20Skills-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20%C2%B7%20OpenCode%20%C2%B7%20Cursor-2a78d6" alt="Agent Skills"></a>
 </p>
 
-Parallel AI agents each like to start a full build or test suite. Three at once, and the machine swaps or the OOM killer strikes. **load guard** puts them in line:
+Give your orchestrating agent the job of load guard. Before it starts another worker, it asks; when the machine is busy, it waits. Its builds and tests go through one small command that keeps them inside a budget. And you can watch all of it live: what the agents do, what they decided and why, and how the machine copes.
 
-- **`lg run -- <cmd>`** waits for a free slot and enough memory, then runs the command in a systemd scope with memory, swap and CPU limits.
-- **`lg admit`** tells an orchestrator if it may start another agent.
-- **A watchdog** stops the newest job when memory runs critically low (exit 75: retry later).
-- **A live dashboard** shows what runs, what waits and why.
-- **Any agent harness** – a skill and short rules teach Claude Code, Codex, Gemini CLI, OpenCode and Cursor to use it.
+- **For the agent:** `lg admit` (start or wait, with the reason), `lg worker start <name> "<task>"`, and `lg run -- <cmd>` for every build or test.
+- **For you:** one page with the verdict, the agents and their tasks, the running and waiting jobs, and a feed of the agents' decisions. Simple view by default, Detailed view for tuning.
+- **Safety nets:** each job runs with memory and CPU limits, and a watchdog stops the newest job when memory runs out.
+- **Any agent harness:** Claude Code, Codex, Gemini CLI, OpenCode, Cursor, or a script.
 
-Per user, no root, no dependencies beyond a standard Linux install.
+Linux, per user, no root, no dependencies beyond a standard install.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/dashboard-light.png">
@@ -50,12 +49,11 @@ Run the same command again to update. It clones to `~/.local/share/load-guard` (
 ## Use
 
 ```bash
-lg status                        # memory, load, jobs, workers, ADMIT/WAIT
-lg run -- npm test               # run a heavy command inside the limits
-lg run --mem 6G -- cargo build   # with a larger memory limit
-lg admit                         # may another agent start?
-lg worker start|end <name>       # register an agent
-lg report 24                     # numbers to tune the limits
+lg admit --for api-refactor                          # may another agent start? (ADMIT or WAIT + reason)
+lg worker start api-refactor "Move the payments API"  # register it, with its task, for the dashboard
+lg run -- npm test                                    # run a build or test inside the limits
+lg worker end api-refactor                            # it is done
+lg status                                             # the same verdict as the dashboard, in the terminal
 ```
 
 ## Agent harnesses

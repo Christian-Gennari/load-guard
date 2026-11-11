@@ -5,7 +5,7 @@
 # https://github.com/Christian-Gennari/load-guard · MIT license
 # Config: ~/.config/load-guard.conf (shell KEY=VALUE lines, see config.example.conf).
 set -uo pipefail
-LG_VERSION=1.1.0
+LG_VERSION=1.2.0
 
 CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
 # shellcheck disable=SC1090
@@ -77,21 +77,25 @@ worker_count() {
 }
 
 # ---- checks: prints reasons, returns 0 when all pass ----
-check() {  # $1 = worker|heavy
-  local mode=$1 ok=0 f l p need
+check() {  # $1 = worker|heavy — prints one plain reason per failed check; returns 0 when all pass
+  local mode=$1 ok=0 f l p need what
   f=$(free_kb); l=$(load1); p=$(psi_mem)
+  what=$([[ $mode == worker ]] && echo "a new worker" || echo "a new build or test")
   need=$([[ $mode == worker ]] && echo "$LG_MIN_FREE_GB" || echo "$LG_HEAVY_FREE_GB")
-  if ! ge "$f" "$(gb_to_kb "$need")"; then echo "free memory $(gb "$f") GB < $need GB"; ok=1; fi
+  if ! ge "$f" "$(gb_to_kb "$need")"; then echo "memory is low: $(gb "$f") GB free, $what needs $need GB"; ok=1; fi
   local maxl=$([[ $mode == worker ]] && echo "$LG_MAX_LOAD" || echo "$LG_HEAVY_MAX_LOAD")
-  if ge "$l" "$maxl" && [[ $l != "$maxl" ]]; then echo "load $l > $maxl"; ok=1; fi
-  if ge "$p" "$LG_MAX_PSI" && [[ $p != "$LG_MAX_PSI" ]]; then echo "memory pressure $p% > $LG_MAX_PSI%"; ok=1; fi
+  if ge "$l" "$maxl" && [[ $l != "$maxl" ]]; then echo "the CPU is busy: load $l, limit $maxl"; ok=1; fi
+  if ge "$p" "$LG_MAX_PSI" && [[ $p != "$LG_MAX_PSI" ]]; then echo "programs wait for memory $p% of the time, limit $LG_MAX_PSI%"; ok=1; fi
   if [[ $mode == heavy ]]; then
     local r t; r=$(runner_count); t=$(( $(heavy_count) + r ))
-    if (( t >= LG_MAX_HEAVY_TOTAL )); then echo "heavy jobs incl. $r CI runner job(s): $t/$LG_MAX_HEAVY_TOTAL"; ok=1; fi
+    if (( t >= LG_MAX_HEAVY_TOTAL )); then echo "$t of $LG_MAX_HEAVY_TOTAL builds and tests run already$( (( r )) && echo " ($r of them CI jobs)")"; ok=1; fi
   fi
   if [[ $mode == worker ]]; then
-    local w; w=$(worker_count)
-    if (( w >= LG_MAX_WORKERS )); then echo "workers $w/$LG_MAX_WORKERS"; ok=1; fi
+    local w names; w=$(worker_count)
+    if (( w >= LG_MAX_WORKERS )); then
+      names=$(find "$WORKERS" -name '*.w' -mmin -"$((LG_STALE_HOURS * 60))" -printf '%f\n' | sed 's/\.w$//' | head -3 | paste -sd, | sed 's/,/, /g')
+      echo "all $LG_MAX_WORKERS worker seats are taken ($names)"; ok=1
+    fi
   fi
   return $ok
 }
@@ -100,7 +104,7 @@ check() {  # $1 = worker|heavy
 check_heavy_now() {
   local why
   if ! why=$(check heavy); then echo "$why"; return 1; fi
-  if (( $(heavy_count) >= LG_MAX_HEAVY )); then echo "all $LG_MAX_HEAVY heavy slots busy"; return 1; fi
+  if (( $(heavy_count) >= LG_MAX_HEAVY )); then echo "all $LG_MAX_HEAVY build and test slots are in use"; return 1; fi
 }
 
 # ---- queue registry: one file per waiting lg process, shown by the dashboard ----
@@ -119,6 +123,7 @@ cmd_status() {
   local ww hw aw=true ah=true
   ww=$(check worker | paste -sd';') ; [[ -z $ww ]] || aw=false
   hw=$(check_heavy_now | paste -sd';'); [[ -z $hw ]] || ah=false
+  if (( json )); then ww=${ww//\\/\\\\}; ww=${ww//\"/\\\"}; hw=${hw//\\/\\\\}; hw=${hw//\"/\\\"}; fi   # JSON-escape the reasons
   if (( json )); then
     printf '{"free_gb":%s,"swap_used_gb":%s,"load1":%s,"cores":%s,"psi_mem_avg10":%s,"heavy":%s,"max_heavy":%s,"workers":%s,"max_workers":%s,"admit_worker":%s,"worker_wait":"%s","admit_heavy":%s,"heavy_wait":"%s","runners":%s,"max_heavy_total":%s}\n' \
       "$(gb "$f")" "$(gb "$s")" "$l" "$(nproc)" "$p" "$h" "$LG_MAX_HEAVY" "$w" "$LG_MAX_WORKERS" \
@@ -137,13 +142,17 @@ cmd_status() {
   if systemctl --user is-active --quiet load-guard-dashboard 2>/dev/null; then echo "dashboard: $(dashboard_url)"; fi
 }
 
-cmd_admit() {  # [--wait] [--for <worker name>] — each decision goes to the event log, so people can see it
-  local wait=0 for="" start=$SECONDS why logged=0
-  while [[ $# -gt 0 ]]; do case $1 in --wait) wait=1; shift;; --for) for=${2:-}; shift 2;; *) shift;; esac; done
+cmd_admit() {  # [--wait] [--for <worker name>] [--override "<reason>"] — each decision goes to the event log
+  local wait=0 for="" over="" start=$SECONDS why logged=0
+  while [[ $# -gt 0 ]]; do case $1 in --wait) wait=1; shift;; --for) for=${2:-}; shift 2;; --override) over=${2:-}; shift 2;; *) shift;; esac; done
   while ! why=$(check worker); do
     why=$(echo "$why" | paste -sd';')
+    if [[ -n $over ]]; then   # the agent decides to start anyway; people see this in the activity feed
+      over=${over//[$'\n\t']/ }; log "admit OVERRIDE for=${for:--} reason=$over was=$why"
+      echo "ADMIT (override: the limits said wait: ${why//;/; })"; return 0
+    fi
     (( logged )) || { log "admit WAIT for=${for:--} why=$why"; logged=1; }
-    if (( ! wait )); then echo "WAIT: $why"; return 1; fi
+    if (( ! wait )); then echo "WAIT: ${why//;/; }. It can start when other work ends or memory frees up."; return 1; fi
     if (( SECONDS - start > LG_WAIT_MAX )); then echo "TIMEOUT after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
     queue_set worker "$why" "lg admit --wait${for:+ --for $for}"
     say "queued worker: $why"; sleep "$LG_POLL"
@@ -196,7 +205,7 @@ cmd_run() {  # [--mem X] [--cpu Y%] [--] cmd...
         exec {fd}>&-
       done
       [[ -n $slot ]] && break
-      why="all $LG_MAX_HEAVY heavy slots busy"
+      why="all $LG_MAX_HEAVY build and test slots are in use"
     fi
     if (( SECONDS - start > LG_WAIT_MAX )); then say "gave up after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
     queue_set heavy "$why" "$cmdline"
@@ -347,6 +356,6 @@ case ${1:-status} in
   config)   for v in ${!LG_@}; do echo "$v=${!v}"; done;;
   version|--version) echo "lg $LG_VERSION";;
   rules)    cat "$(dirname "$(dirname "$(readlink -f "$0")")")/rules/load-guard-rules.md";;
-  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] [--for name] | worker start <name> [task]|end|touch|list | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
+  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] [--for name] [--override reason] | worker start <name> [task]|end|touch|list | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
   *) say "unknown command: $1 (lg help)"; exit 2;;
 esac
