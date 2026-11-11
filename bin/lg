@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# lg — load guard. Keeps a shared Linux machine from running out of memory when several
+# agents or workers run builds and tests at once: an admission gate for workers, shared
+# slots with cgroup limits for heavy commands, a memory watchdog and a live dashboard.
+# https://github.com/Christian-Gennari/load-guard · MIT license
+# Config: ~/.config/load-guard.conf (shell KEY=VALUE lines, see config.example.conf).
+set -uo pipefail
+LG_VERSION=1.0.0
+
+CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
+# shellcheck disable=SC1090
+[[ -f "$CONF" ]] && . "$CONF"
+
+# ---- defaults: only for keys that the config file or the environment did not set ----
+_cores=$(nproc)
+_ram_gb=$(awk '/^MemTotal:/{printf "%.1f", $2/1048576}' /proc/meminfo)
+_pick() { awk -v r="$_ram_gb" -v f="$1" -v lo="$2" -v hi="$3" 'BEGIN{v=r*f; if(v<lo)v=lo; if(v>hi)v=hi; printf "%g", int(v*2+0.5)/2}'; }
+: "${LG_MAX_WORKERS:=3}"                      # parallel workers (agents) at once
+: "${LG_MAX_HEAVY:=2}"                        # heavy jobs (lg run: builds, tests) at once, machine-wide
+: "${LG_MAX_HEAVY_TOTAL:=$((LG_MAX_HEAVY + 1))}"  # lg jobs + CI runner jobs at once
+: "${LG_MIN_FREE_GB:=$(_pick 0.25 1 4)}"      # free memory (MemAvailable) to admit a worker
+: "${LG_HEAVY_FREE_GB:=$LG_MIN_FREE_GB}"      # free memory to start a heavy job
+: "${LG_KILL_FREE_GB:=$(_pick 0.1 0.5 1.5)}"  # watchdog stops the newest heavy job below this
+: "${LG_MAX_LOAD:=$(( _cores * 4 / 3 ))}"     # 1-min load ceiling to admit a worker
+: "${LG_HEAVY_MAX_LOAD:=$_cores}"             # 1-min load ceiling to start a heavy job
+: "${LG_MAX_PSI:=5}"                          # memory pressure ceiling (% of time stalled, some avg10)
+: "${LG_JOB_MEM:=$(_pick 0.3 1 4)G}"          # MemoryMax per heavy job
+: "${LG_JOB_SWAP:=256M}"                      # MemorySwapMax per heavy job (stops swap thrash)
+: "${LG_JOB_CPU:=$(( (_cores + 2) / 3 * 100 ))%}"  # CPUQuota per heavy job (100% = 1 core)
+: "${LG_JOB_NICE:=10}"
+: "${LG_EXCLUSIVE_MATCH:=}"                   # glob: commands that may run only one at a time (e.g. '*dotnet test*')
+: "${LG_EXCLUSIVE_UNLESS:=}"                  # glob: ... except when they also match this (e.g. '*--filter*')
+: "${LG_CI_PROCESS:=Runner.Worker}"           # process name of a CI job (GitHub Actions self-hosted runner)
+: "${LG_WATCH_INTERVAL:=10}"                  # watchdog poll seconds
+: "${LG_POLL:=30}"                            # queue re-check seconds
+: "${LG_WAIT_MAX:=5400}"                      # max seconds to wait in a queue (90 min)
+: "${LG_STALE_HOURS:=8}"                      # worker registrations older than this are ignored
+: "${LG_METRICS_EVERY:=60}"                   # watchdog writes one metrics line this often (seconds)
+: "${LG_DASH_PORT:=8377}"                     # live dashboard port (lg dashboard)
+: "${LG_DASH_BIND:=127.0.0.1}"                # dashboard listen address
+: "${LG_DASH_INTERVAL:=2}"                    # dashboard sample seconds (no samples while no browser is connected)
+export LG_CONF="$CONF"
+
+STATE="${XDG_CACHE_HOME:-$HOME/.cache}/load-guard"
+JOBS="$STATE/jobs"; WORKERS="$STATE/workers"; SLOTS="$STATE/slots"; LOG="$STATE/events.log"; METRICS="$STATE/metrics.log"
+QUEUE="$STATE/queue"
+mkdir -p "$JOBS" "$WORKERS" "$SLOTS" "$QUEUE"
+
+EX_TEMPFAIL=75
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+say() { printf 'load-guard: %s\n' "$*" >&2; }
+
+# ---- metrics ----
+free_kb()  { awk '/^MemAvailable:/{print $2}' /proc/meminfo; }
+swap_used_kb() { awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{print t-f}' /proc/meminfo; }
+load1()    { cut -d' ' -f1 /proc/loadavg; }
+psi_mem()  { awk '/^some/{split($2,a,"=");print a[2]}' /proc/pressure/memory 2>/dev/null || echo 0; }
+gb()       { awk -v k="$1" 'BEGIN{printf "%.1f", k/1048576}'; }
+ge()       { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }   # a >= b (floats)
+gb_to_kb() { awk -v g="$1" 'BEGIN{printf "%d", g*1048576}'; }
+
+# ---- registries ----
+prune_jobs() {
+  local f unit
+  for f in "$JOBS"/*.job; do
+    [[ -e "$f" ]] || continue
+    unit=$(basename "$f" .job)
+    systemctl --user is-active --quiet "$unit.scope" 2>/dev/null || rm -f "$f"
+  done
+}
+heavy_count() { prune_jobs; find "$JOBS" -name '*.job' | wc -l; }
+# CI jobs on this machine (for example self-hosted GitHub Actions runners) count as heavy jobs.
+runner_count() { [[ -n $LG_CI_PROCESS ]] || { echo 0; return; }; pgrep -c -x "$LG_CI_PROCESS" 2>/dev/null || true; }
+worker_count() {
+  find "$WORKERS" -name '*.w' -mmin -"$((LG_STALE_HOURS * 60))" | wc -l
+}
+
+# ---- checks: prints reasons, returns 0 when all pass ----
+check() {  # $1 = worker|heavy
+  local mode=$1 ok=0 f l p need
+  f=$(free_kb); l=$(load1); p=$(psi_mem)
+  need=$([[ $mode == worker ]] && echo "$LG_MIN_FREE_GB" || echo "$LG_HEAVY_FREE_GB")
+  if ! ge "$f" "$(gb_to_kb "$need")"; then echo "free memory $(gb "$f") GB < $need GB"; ok=1; fi
+  local maxl=$([[ $mode == worker ]] && echo "$LG_MAX_LOAD" || echo "$LG_HEAVY_MAX_LOAD")
+  if ge "$l" "$maxl" && [[ $l != "$maxl" ]]; then echo "load $l > $maxl"; ok=1; fi
+  if ge "$p" "$LG_MAX_PSI" && [[ $p != "$LG_MAX_PSI" ]]; then echo "memory pressure $p% > $LG_MAX_PSI%"; ok=1; fi
+  if [[ $mode == heavy ]]; then
+    local r t; r=$(runner_count); t=$(( $(heavy_count) + r ))
+    if (( t >= LG_MAX_HEAVY_TOTAL )); then echo "heavy jobs incl. $r CI runner job(s): $t/$LG_MAX_HEAVY_TOTAL"; ok=1; fi
+  fi
+  if [[ $mode == worker ]]; then
+    local w; w=$(worker_count)
+    if (( w >= LG_MAX_WORKERS )); then echo "workers $w/$LG_MAX_WORKERS"; ok=1; fi
+  fi
+  return $ok
+}
+
+# check heavy plus the slot count: can a new `lg run` start now?
+check_heavy_now() {
+  local why
+  if ! why=$(check heavy); then echo "$why"; return 1; fi
+  if (( $(heavy_count) >= LG_MAX_HEAVY )); then echo "all $LG_MAX_HEAVY heavy slots busy"; return 1; fi
+}
+
+# ---- queue registry: one file per waiting lg process, shown by the dashboard ----
+QSINCE=""
+queue_set() {  # kind(worker|heavy) reasons command
+  [[ -n $QSINCE ]] || { QSINCE=$(date +%s); trap 'rm -f "$QUEUE/$$.q"' EXIT; }
+  printf '%s\t%s\t%s\t%s\t%s\n' "$QSINCE" "$1" "$(echo "$2" | paste -sd';')" "$PWD" "$3" >"$QUEUE/$$.q"
+}
+queue_clear() { rm -f "$QUEUE/$$.q"; }
+
+# ---- commands ----
+cmd_status() {
+  local json=0; [[ ${1:-} == --json ]] && json=1
+  local f s l p h w
+  f=$(free_kb); s=$(swap_used_kb); l=$(load1); p=$(psi_mem); h=$(heavy_count); w=$(worker_count)
+  local ww hw aw=true ah=true
+  ww=$(check worker | paste -sd';') ; [[ -z $ww ]] || aw=false
+  hw=$(check_heavy_now | paste -sd';'); [[ -z $hw ]] || ah=false
+  if (( json )); then
+    printf '{"free_gb":%s,"swap_used_gb":%s,"load1":%s,"cores":%s,"psi_mem_avg10":%s,"heavy":%s,"max_heavy":%s,"workers":%s,"max_workers":%s,"admit_worker":%s,"worker_wait":"%s","admit_heavy":%s,"heavy_wait":"%s","runners":%s,"max_heavy_total":%s}\n' \
+      "$(gb "$f")" "$(gb "$s")" "$l" "$(nproc)" "$p" "$h" "$LG_MAX_HEAVY" "$w" "$LG_MAX_WORKERS" \
+      "$aw" "$ww" "$ah" "$hw" "$(runner_count)" "$LG_MAX_HEAVY_TOTAL"
+    return
+  fi
+  printf 'free %s GB | swap used %s GB | load %s / %s cores | mem pressure %s%%\n' "$(gb "$f")" "$(gb "$s")" "$l" "$(nproc)" "$p"
+  printf 'heavy jobs %s/%s | CI runner jobs %s (total cap %s) | workers %s/%s\n' "$h" "$LG_MAX_HEAVY" "$(runner_count)" "$LG_MAX_HEAVY_TOTAL" "$w" "$LG_MAX_WORKERS"
+  local x
+  for x in "$JOBS"/*.job; do [[ -e $x ]] && printf '  job    %s\n' "$(cat "$x")"; done
+  for x in "$WORKERS"/*.w; do [[ -e $x ]] && printf '  worker %s  (since %s)\n' "$(basename "$x" .w)" "$(date -r "$x" '+%H:%M')"; done
+  if [[ $aw == true ]]; then echo "new worker: ADMIT"; else echo "new worker: WAIT ($ww)"; fi
+  if [[ $ah == true ]]; then echo "new heavy job: ADMIT"; else echo "new heavy job: WAIT ($hw)"; fi
+  if pgrep -f 'lg watchdog' >/dev/null || systemctl --user is-active --quiet load-guard-watchdog 2>/dev/null; then
+    echo "watchdog: running"; else echo "watchdog: NOT running (lg watchdog --install)"; fi
+  if systemctl --user is-active --quiet load-guard-dashboard 2>/dev/null; then echo "dashboard: $(dashboard_url)"; fi
+}
+
+cmd_admit() {  # [--wait]
+  local wait=0; [[ ${1:-} == --wait ]] && wait=1
+  local start=$SECONDS why
+  while ! why=$(check worker); do
+    if (( ! wait )); then echo "WAIT: $(echo "$why" | paste -sd';')"; return 1; fi
+    if (( SECONDS - start > LG_WAIT_MAX )); then echo "TIMEOUT after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
+    queue_set worker "$why" "lg admit --wait"
+    say "queued worker: $(echo "$why" | paste -sd';')"; sleep "$LG_POLL"
+  done
+  queue_clear
+  echo "ADMIT"
+}
+
+cmd_worker() {  # start|end|list <name>
+  local sub=${1:-list} name=${2:-}
+  case $sub in
+    start) [[ -n $name ]] || { say "usage: lg worker start <name>"; return 2; }
+           touch "$WORKERS/$name.w"; log "worker start $name";;
+    end)   rm -f "$WORKERS/$name.w"; log "worker end $name";;
+    touch) touch "$WORKERS/$name.w";;
+    list)  ls -1 "$WORKERS" 2>/dev/null | sed 's/\.w$//';;
+    *) say "usage: lg worker start|end|touch|list <name>"; return 2;;
+  esac
+}
+
+cmd_run() {  # [--mem X] [--cpu Y%] [--] cmd...
+  local mem=$LG_JOB_MEM cpu=$LG_JOB_CPU
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --mem) mem=$2; shift 2;; --cpu) cpu=$2; shift 2;;
+      --) shift; break;; *) break;;
+    esac
+  done
+  [[ $# -gt 0 ]] || { say "usage: lg run [--mem 3G] [--cpu 400%] -- <command...>"; return 2; }
+
+  local start=$SECONDS fd slot="" i why sfd=""
+  local cmdline="${*//[$'\n\t']/ }"   # one line for the job file, the event log and the queue
+  # Commands that match LG_EXCLUSIVE_MATCH (for example a full test suite) run one at a time machine-wide.
+  # shellcheck disable=SC2053
+  if [[ -n $LG_EXCLUSIVE_MATCH && $cmdline == $LG_EXCLUSIVE_MATCH && ( -z $LG_EXCLUSIVE_UNLESS || $cmdline != $LG_EXCLUSIVE_UNLESS ) ]]; then
+    exec {sfd}>"$SLOTS/exclusive.lock"
+    until flock -n "$sfd"; do
+      if (( SECONDS - start > LG_WAIT_MAX )); then say "gave up after ${LG_WAIT_MAX}s: another exclusive job runs"; return $EX_TEMPFAIL; fi
+      queue_set heavy "another exclusive job runs (LG_EXCLUSIVE_MATCH)" "$cmdline"
+      say "queued: another exclusive job runs (LG_EXCLUSIVE_MATCH) — retry in ${LG_POLL}s"; sleep "$LG_POLL"
+    done
+  fi
+  while :; do
+    if why=$(check heavy); then
+      for ((i = 1; i <= LG_MAX_HEAVY; i++)); do
+        exec {fd}>"$SLOTS/$i.lock"
+        if flock -n "$fd"; then slot=$i; break; fi
+        exec {fd}>&-
+      done
+      [[ -n $slot ]] && break
+      why="all $LG_MAX_HEAVY heavy slots busy"
+    fi
+    if (( SECONDS - start > LG_WAIT_MAX )); then say "gave up after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
+    queue_set heavy "$why" "$cmdline"
+    say "queued: $(echo "$why" | paste -sd';') — retry in ${LG_POLL}s"; sleep "$LG_POLL"
+  done
+  queue_clear
+
+  local unit="lg-$(date +%s)-$RANDOM" t0=$SECONDS peakf="$STATE/peak.$$"
+  printf '%s slot=%s mem=%s cpu=%s cwd=%s cmd=%s\n' "$(date '+%H:%M:%S')" "$slot" "$mem" "$cpu" "$PWD" "$cmdline" >"$JOBS/$unit.job"
+  log "start $unit slot=$slot cwd=$PWD cmd=$cmdline"
+  say "running in $unit (slot $slot, mem $mem, cpu $cpu)"
+  systemd-run --user --scope --quiet --unit="$unit" --collect \
+    -p MemoryMax="$mem" -p MemorySwapMax="$LG_JOB_SWAP" -p CPUQuota="$cpu" --nice="$LG_JOB_NICE" \
+    --setenv=LOAD_GUARD=1 -- bash -c 'cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); pf=$1; shift
+      "$@"; rc=$?; cat "$cg/memory.peak" >"$pf" 2>/dev/null; exit $rc' _ "$peakf" "$@"
+  local rc=$? peak="limit"
+  [[ -s $peakf ]] && peak="$(( $(cat "$peakf") / 1048576 ))MB"; rm -f "$peakf"
+  local stats="rc=$rc dur=$((SECONDS - t0))s peak=$peak"
+  flock -u "$fd"; exec {fd}>&-
+  [[ -n $sfd ]] && { flock -u "$sfd"; exec {sfd}>&-; }
+  rm -f "$JOBS/$unit.job"
+  if [[ -f "$STATE/killed/$unit" ]]; then
+    rm -f "$STATE/killed/$unit"; log "end $unit $stats (stopped by watchdog)"
+    say "STOPPED BY LOAD GUARD: the server ran low on memory. Wait, then run the same command again."
+    return $EX_TEMPFAIL
+  fi
+  if (( rc == 137 )) || systemctl --user show "$unit.scope" -p Result 2>/dev/null | grep -q oom; then
+    say "the command hit its memory limit ($mem). Run fewer tests at once or a narrower test target."
+  fi
+  log "end $unit $stats cmd=$cmdline"
+  return $rc
+}
+
+cmd_watchdog() {
+  if [[ ${1:-} == --install ]]; then
+    local self; self=$(readlink -f "$0")
+    mkdir -p "$HOME/.config/systemd/user"
+    cat >"$HOME/.config/systemd/user/load-guard-watchdog.service" <<EOF
+[Unit]
+Description=load guard memory watchdog (stops the newest lg run job when memory is low)
+
+[Service]
+ExecStart=$self watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload && systemctl --user enable --now load-guard-watchdog.service
+    systemctl --user --no-pager status load-guard-watchdog.service | head -4
+    return
+  fi
+  mkdir -p "$STATE/killed"
+  log "watchdog started (kill below $LG_KILL_FREE_GB GB free)"
+  local kill_kb newest f info last=0
+  kill_kb=$(gb_to_kb "$LG_KILL_FREE_GB")
+  while :; do
+    if (( SECONDS - last >= LG_METRICS_EVERY )); then
+      last=$SECONDS
+      printf '%s %s %s %s %s %s %s %s\n' "$(date +%s)" "$(gb "$(free_kb)")" "$(gb "$(swap_used_kb)")" "$(load1)" "$(psi_mem)" "$(heavy_count)" "$(worker_count)" "$(runner_count)" >>"$METRICS"
+    fi
+    if ! ge "$(free_kb)" "$kill_kb"; then
+      prune_jobs
+      newest=$(ls -1t "$JOBS"/*.job 2>/dev/null | head -1)
+      if [[ -n $newest ]]; then
+        f=$(basename "$newest" .job); info=$(cat "$newest" 2>/dev/null)
+        touch "$STATE/killed/$f"
+        systemctl --user kill --signal=SIGKILL "$f.scope" 2>/dev/null
+        log "WATCHDOG stopped $f: free $(gb "$(free_kb)") GB < $LG_KILL_FREE_GB GB ($info)"
+        sleep 20   # let memory settle before judging again
+      else
+        log "WATCHDOG low memory ($(gb "$(free_kb)") GB) but no lg run job to stop"
+        sleep 60
+      fi
+    fi
+    sleep "$LG_WATCH_INTERVAL"
+  done
+}
+
+cmd_report() {  # [hours] — summary of metrics and jobs for tuning the limits
+  local h=${1:-24} since; since=$(( $(date +%s) - h * 3600 ))
+  echo "== last ${h}h (metrics: epoch free_gb swap_gb load1 psi heavy workers runners)"
+  awk -v s="$since" '$1>=s{n++; if(n==1||$2<mf)mf=$2; if($3>ms)ms=$3; if($4>ml)ml=$4; if($5>mp)mp=$5; if($6>mh)mh=$6; if($7>mw)mw=$7; if($8>mr)mr=$8; if($2<4)low++}
+    END{if(!n){print "no metrics yet";exit} printf "samples %d | min free %.1f GB | max swap %.1f GB | max load %s | max psi %s%% | max heavy %d | max workers %d | max CI runner jobs %d | minutes under 4 GB free: %d\n",n,mf,ms,ml,mp,mh,mw,mr+0,low+0}' "$METRICS" 2>/dev/null
+  echo "== watchdog actions"; grep -c WATCHDOG "$LOG" 2>/dev/null; grep WATCHDOG "$LOG" 2>/dev/null | tail -5
+  echo "== heavy jobs (end events)"; grep ' end lg-' "$LOG" 2>/dev/null | tail -n 40
+}
+
+dashboard_url() {
+  local dns=""
+  [[ $LG_DASH_BIND == 127.0.0.1 ]] && command -v tailscale >/dev/null && dns=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)
+  if [[ -n $dns ]] && tailscale serve status 2>/dev/null | grep -q ":$LG_DASH_PORT "; then echo "https://$dns:$LG_DASH_PORT/"
+  else echo "http://$LG_DASH_BIND:$LG_DASH_PORT/"; fi
+}
+
+cmd_dashboard() {  # [--install [--tailscale]|--uninstall|--url|--demo] — live web page: load, jobs, queue, workers, events
+  local self dir svc="$HOME/.config/systemd/user/load-guard-dashboard.service"
+  self=$(readlink -f "$0"); dir=$(dirname "$(dirname "$self")")/dashboard
+  case ${1:-} in
+    --install)
+      mkdir -p "$(dirname "$svc")"
+      cat >"$svc" <<EOF
+[Unit]
+Description=load guard live dashboard (samples only while a browser is connected)
+
+[Service]
+ExecStart=/usr/bin/env python3 $dir/server.py
+Restart=always
+RestartSec=5
+MemoryMax=128M
+Nice=5
+
+[Install]
+WantedBy=default.target
+EOF
+      systemctl --user daemon-reload && systemctl --user enable load-guard-dashboard.service && systemctl --user restart load-guard-dashboard.service
+      if [[ ${2:-} == --tailscale ]]; then   # publish to your tailnet only (HTTPS, not the public internet)
+        command -v tailscale >/dev/null || { say "tailscale is not installed"; return 1; }
+        tailscale serve status 2>/dev/null | grep -q ":$LG_DASH_PORT " \
+          || tailscale serve --bg --https="$LG_DASH_PORT" "http://127.0.0.1:$LG_DASH_PORT" >/dev/null \
+          || say "could not set up Tailscale serve (try: sudo tailscale set --operator=\$USER)"
+      fi
+      echo "dashboard: $(dashboard_url)";;
+    --uninstall)
+      systemctl --user disable --now load-guard-dashboard.service 2>/dev/null; rm -f "$svc"; systemctl --user daemon-reload
+      command -v tailscale >/dev/null && tailscale serve status 2>/dev/null | grep -q ":$LG_DASH_PORT " \
+        && tailscale serve --https="$LG_DASH_PORT" off >/dev/null 2>&1
+      echo "dashboard removed";;
+    --url) dashboard_url;;
+    "") exec python3 "$dir/server.py";;
+    --demo) exec python3 "$dir/server.py" --demo;;
+    *) say "usage: lg dashboard [--install [--tailscale]|--uninstall|--url|--demo]"; return 2;;
+  esac
+}
+
+cmd_events() { if [[ ${1:-} == -f ]]; then tail -n 20 -F "$LOG"; else tail -n "${1:-30}" "$LOG" 2>/dev/null; fi; }
+
+case ${1:-status} in
+  status)   shift || true; cmd_status "$@";;
+  admit)    shift; cmd_admit "$@";;
+  worker)   shift; cmd_worker "$@";;
+  run)      shift; cmd_run "$@";;
+  watchdog) shift; cmd_watchdog "$@";;
+  events)   shift; cmd_events "$@";;
+  report)   shift; cmd_report "$@";;
+  dashboard) shift; cmd_dashboard "$@";;
+  config)   for v in ${!LG_@}; do echo "$v=${!v}"; done;;
+  version|--version) echo "lg $LG_VERSION";;
+  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] | worker start|end|touch|list <name> | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | config | version";;
+  *) say "unknown command: $1 (lg help)"; exit 2;;
+esac
