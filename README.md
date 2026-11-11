@@ -1,33 +1,32 @@
-# load guard
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo-light.svg" alt="load guard" height="72">
+  </picture>
+</p>
 
-**Run many coding agents on one Linux machine without running it out of memory.**
+<p align="center"><b>Run many coding agents on one Linux machine without running out of memory.</b></p>
 
-When several AI agents (Claude Code subagents, OpenCode, Codex, CI jobs…) work on the same machine, each one tends to start its own full build or test suite. Two or three of those at once can push the machine into swap or the out-of-memory killer, and then everything on it slows down or dies.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2a78d6" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20systemd-2a78d6" alt="Linux with systemd">
+  <a href="https://agentskills.io"><img src="https://img.shields.io/badge/Agent%20Skills-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20%C2%B7%20OpenCode%20%C2%B7%20Cursor-2a78d6" alt="Agent Skills"></a>
+</p>
 
-load guard is a small Bash tool, `lg`, plus an optional live dashboard:
+Parallel AI agents each like to start a full build or test suite. Three at once, and the machine swaps or the OOM killer strikes. **load guard** puts them in line:
 
-- **Admission gate for workers** – `lg admit` says `ADMIT` or `WAIT: <reasons>` before an orchestrator starts another agent.
-- **Slots and hard limits for heavy commands** – `lg run -- npm test` waits for a free machine-wide slot and enough free memory, then runs the command in its own systemd scope with a memory limit, a swap limit, a CPU quota and a lower priority.
-- **Memory watchdog** – when free memory gets critically low, it stops the newest `lg run` job (only those) and tells the caller to retry later (exit code 75).
-- **Live dashboard** – one page that shows if there is room for more work, what runs now, what waits and why, and how the last 24 hours went.
-- **Works with any agent harness** – `lg` is a plain shell command. The included [Agent Skills](https://agentskills.io) skill (`SKILL.md`) is linked where Claude Code, Codex, Gemini CLI, Cursor and OpenCode find it, and `--rules` adds short load rules to their global instruction files, so every agent and worker follows them.
+- **`lg run -- <cmd>`** waits for a free slot and enough memory, then runs the command in a systemd scope with memory, swap and CPU limits.
+- **`lg admit`** tells an orchestrator if it may start another agent.
+- **A watchdog** stops the newest job when memory runs critically low (exit 75: retry later).
+- **A live dashboard** shows what runs, what waits and why.
+- **Any agent harness** – a skill and short rules teach Claude Code, Codex, Gemini CLI, OpenCode and Cursor to use it.
 
-Everything is per user, shared by all sessions of that user on the machine, so the limits hold across terminals and agents. No root, no daemon besides two small user services, no dependencies outside a standard Linux install.
+Per user, no root, no dependencies beyond a standard Linux install.
 
-![The dashboard in dark mode](docs/dashboard-dark.png)
-
-<details>
-<summary>Light mode</summary>
-
-![The dashboard in light mode](docs/dashboard-light.png)
-</details>
-
-## Requirements
-
-- Linux with **systemd** (user services) and **cgroup v2**: any current Ubuntu, Debian, Fedora, Arch, or WSL2 with systemd turned on
-- Bash 4+, Python 3.8+, `flock`, `pgrep` (all in a normal install)
-- For the per-job memory limit, the memory controller must be delegated to user services. This is the default on current systemd versions; check with
-  `cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.subtree_control` (it should list `memory`).
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/dashboard-light.png">
+  <img src="docs/dashboard-dark.png" alt="The load guard dashboard">
+</picture>
 
 ## Install
 
@@ -35,111 +34,48 @@ Everything is per user, shared by all sessions of that user on the machine, so t
 curl -fsSL https://raw.githubusercontent.com/Christian-Gennari/load-guard/main/install.sh | bash -s -- --rules
 ```
 
-This clones the repository to `~/.local/share/load-guard` and runs its installer with the options after `--`. To read the script first, or to choose the folder, clone it yourself:
-
-```bash
-git clone https://github.com/Christian-Gennari/load-guard ~/.local/share/load-guard
-~/.local/share/load-guard/install.sh --rules
-```
-
-You can clone it anywhere (for example `~/.claude/skills/load-guard` if you use only Claude Code). With the one-line command, set `LG_DIR=<folder>` to choose the folder. The installer:
-
-1. checks the requirements,
-2. links `lg` into `~/.local/bin` (agents need it on PATH),
-3. creates `~/.config/load-guard.conf` (all lines commented, so the defaults apply),
-4. links the skill into the shared skill folders of your agent harnesses (see [Agent harnesses](#agent-harnesses)),
-5. with `--rules`, adds the load rules to the global instruction file of each harness it finds,
-6. starts two user services: the watchdog, and the dashboard on <http://127.0.0.1:8377/>.
+Run the same command again to update. It clones to `~/.local/share/load-guard` (set `LG_DIR` to change it), puts `lg` on PATH, links the skill for your agents, and starts the watchdog and the dashboard on <http://127.0.0.1:8377/>.
 
 | Option | Effect |
 |---|---|
-| `--rules` | Add the load rules to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and `~/.config/opencode/AGENTS.md` (only for harnesses that are installed). Recommended. |
-| `--tailscale` | Also publish the dashboard to your tailnet over HTTPS with `tailscale serve` (not to the public internet). |
-| `--no-dashboard` | Install the watchdog only. |
-| `--no-services` | No systemd user services. |
-| `--no-skill-links` | Do not link the skill into the harness skill folders (and skip `--rules`). |
-| `--uninstall` | Remove what the installer added: services, skill links, the rules blocks and the PATH link. Your config and state stay. |
+| `--rules` | Add the load rules to the global instruction file of each agent harness found. Recommended. |
+| `--tailscale` | Publish the dashboard to your tailnet over HTTPS. |
+| `--no-dashboard` / `--no-services` / `--no-skill-links` | Skip that part. |
+| `--uninstall` | Remove everything the installer added. Your config and state stay. |
 
-User services stop when you log out. On a server, run `sudo loginctl enable-linger $USER` once so they keep running.
+**Needs:** Linux with systemd user services and cgroup v2 (current Ubuntu, Debian, Fedora, Arch; WSL2 with systemd), Bash 4, Python 3.8. On a server, run `sudo loginctl enable-linger $USER` so the services keep running after you log out.
 
-To update, run the same one-line command again. It finds the existing install (through `~/.local/bin/lg`), pulls the new version, puts the rules block up to date and restarts the services. From a clone: `git pull && ./install.sh --rules`.
-
-**Try the dashboard first, without installing:** `python3 dashboard/server.py --demo` and open <http://127.0.0.1:8377/>. It shows synthetic data.
+**Try the dashboard only:** `python3 dashboard/server.py --demo` shows synthetic data.
 
 ## Use
 
 ```bash
-lg status                          # free memory, load, jobs, workers, ADMIT/WAIT
-lg run -- npm test                 # run a heavy command inside the limits (waits for a slot)
-lg run --mem 6G -- cargo build     # with a larger memory limit for this job
-lg admit && start-another-agent    # gate for a new worker
-lg worker start api-refactor       # register a worker …
-lg worker end api-refactor         # … and remove it when it is done
-lg report 24                       # numbers to tune the limits
-lg dashboard --url                 # where the dashboard is
+lg status                        # memory, load, jobs, workers, ADMIT/WAIT
+lg run -- npm test               # run a heavy command inside the limits
+lg run --mem 6G -- cargo build   # with a larger memory limit
+lg admit                         # may another agent start?
+lg worker start|end <name>       # register an agent
+lg report 24                     # numbers to tune the limits
 ```
-
-Exit code **75** from `lg run` means the job was stopped by the watchdog, or waited too long in the queue: wait a moment and run it again.
-
-In your agent, say "use the load guard", or just start parallel work: the skill tells the agent to check `lg admit` before each new worker, to register workers, and to give every worker a short brief that makes it run builds and tests through `lg run`. `lg rules` prints the short rules text.
 
 ## Agent harnesses
 
-`lg` and the dashboard do not depend on one harness: any agent that can run a shell command can use them, and all agents of a user share the same limits. So Claude Code, Codex, Gemini CLI, Cursor, OpenCode and your own scripts can work on one machine at the same time.
+`lg` is a plain shell command, so every agent shares the same limits. The installer sets up two things:
 
-There are two ways an agent learns about load guard, and the installer sets up both:
-
-**The skill** (`SKILL.md`, the open [Agent Skills](https://agentskills.io) format). The agent loads it when it is relevant, for example before it fans out work. The installer links this folder into the two shared skill folders:
-
-| Folder | Read by |
-|---|---|
-| `~/.agents/skills/` | Codex, Gemini CLI, Cursor, OpenCode |
-| `~/.claude/skills/` | Claude Code, Cursor, OpenCode |
-
-**The rules** (`rules/load-guard-rules.md`, about ten lines). A skill loads only when the agent decides it is relevant, so a worker that was told only "fix this test" may never load it. The rules are always in context: run builds and tests through `lg run`, wait when queued, rerun after exit 75, check `lg admit` before parallel workers. With `--rules`, the installer adds them as a marked block (`<!-- load-guard:begin … -->`) to:
-
-| Harness | Global instruction file |
-|---|---|
-| Claude Code | `~/.claude/CLAUDE.md` |
-| Codex | `~/.codex/AGENTS.md` (or `$CODEX_HOME/AGENTS.md`) |
-| Gemini CLI | `~/.gemini/GEMINI.md` |
-| OpenCode | `~/.config/opencode/AGENTS.md` if it exists; else OpenCode reads `~/.claude/CLAUDE.md`, so the installer does not create its own file (that would hide your Claude rules from OpenCode) |
-| Cursor | user rules are in Settings › Rules: paste the output of `lg rules` there |
-
-Running the installer again replaces the block; `--uninstall` removes it and leaves the rest of each file as it was. For any other tool, put the output of `lg rules` into its instruction file or project `AGENTS.md`. The rules say to ignore them when `lg` is not installed, so they are safe in dotfiles that you share between machines.
+- **The skill** (`SKILL.md`, [Agent Skills](https://agentskills.io) format), linked into `~/.agents/skills` (Codex, Gemini CLI, Cursor, OpenCode) and `~/.claude/skills` (Claude Code). Agents load it when they fan out work.
+- **The rules** (`--rules`), ten always-on lines, so a worker that never loads the skill still uses `lg run`. They go into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, and `~/.config/opencode/AGENTS.md` if it exists (otherwise OpenCode reads `CLAUDE.md`). For Cursor or any other tool, paste the output of `lg rules`.
 
 ## Configuration
 
-Defaults are calculated from the machine (memory and core count). On a 16 GB, 12-core machine: 3 workers, 2 heavy jobs, 4 GB free memory to start work, 4 GB memory and 4 cores per heavy job, watchdog at 1.5 GB free. Run `lg config` to see yours.
-
-Change them in `~/.config/load-guard.conf`; [`config.example.conf`](config.example.conf) lists every key. Two worth knowing:
+Defaults come from the machine's memory and cores; `lg config` shows them. Override them in `~/.config/load-guard.conf` (every key: [`config.example.conf`](config.example.conf)). For example, to let only one full test suite run at a time:
 
 ```bash
-# Let only one full test suite run at a time, but allow filtered runs in parallel:
 LG_EXCLUSIVE_MATCH='*dotnet test*'
 LG_EXCLUSIVE_UNLESS='*--filter*'
-
-# CI jobs on this machine count as heavy jobs (GitHub Actions self-hosted runners by default):
-LG_CI_PROCESS=Runner.Worker
 ```
 
-The dashboard's "Last 24 hours" panel tells you when the limits are too tight or too loose. You can keep notes about your machine (measured peak memory of your test suites, other services) in `~/.config/load-guard.notes.md`; the Claude Code skill reads that file first.
-
-## Dashboard
-
-The dashboard (`dashboard/server.py`, Python standard library only, about 12 MB of memory) pushes a new sample to the browser every 2 seconds over Server-Sent Events. It takes samples only while a browser is connected, so it costs nothing when nobody looks.
-
-It shows a verdict ("Room for more work", or the reasons new work waits), memory, swap, load, CPU and memory pressure with 15-minute trends, each running job with its live memory against its limit, the queue, history charts with the limit zones and watchdog stops, a 24-hour summary with tuning advice, finished jobs with duration and peak memory, memory by program, and the event log. Dark mode is the default; there is a light / dark / system switch.
-
-The page has **no login**. It listens on `127.0.0.1` by default; use `--tailscale` (or your own reverse proxy with authentication) to reach it from other devices. JSON endpoints: `/api/status`, `/api/history?hours=N`, `/api/recent?hours=N`.
-
-## How it works
-
-- State lives in `~/.cache/load-guard/`: one file per running job, worker and queued command, `flock` locks for the slots, an event log and a one-line-per-minute metrics log written by the watchdog.
-- `lg run` takes a slot lock, then starts the command with `systemd-run --user --scope` and the properties `MemoryMax`, `MemorySwapMax`, `CPUQuota` and `--nice`. When the job ends, it logs the duration and the cgroup's peak memory.
-- The checks use `MemAvailable` from `/proc/meminfo`, the 1-minute load average, and memory pressure (PSI) from `/proc/pressure/memory`.
-- Only commands that go through `lg run` get hard limits. Everything else depends on the agents following the brief in `SKILL.md`.
+The dashboard's "Last 24 hours" panel says when the limits are too tight or too loose. It has no login: keep it on `127.0.0.1` or use `--tailscale`.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The bundled fonts are under the SIL Open Font License 1.1: [Inter](dashboard/fonts/LICENSE-Inter.txt) and [JetBrains Mono](dashboard/fonts/LICENSE-JetBrainsMono.txt).
+MIT. Bundled fonts: [Inter](dashboard/fonts/LICENSE-Inter.txt) and [JetBrains Mono](dashboard/fonts/LICENSE-JetBrainsMono.txt), SIL Open Font License 1.1.
