@@ -382,8 +382,8 @@ class Hub:
             return []
         try:
             size = os.path.getsize(EVENTS)
-            if size < self.log_pos:
-                self.log_pos = 0
+            if size < self.log_pos:  # the watchdog trimmed old lines: continue from the new end
+                self.log_pos = size
             if size == self.log_pos:
                 return []
             with open(EVENTS, "rb") as f:

@@ -10,6 +10,7 @@ Only the keys of the Settings view are accepted. On a bad key or value it prints
 "KEY: message" lines to stderr, exits 2 and leaves the file unchanged. Changed keys are
 printed as "KEY OLD -> NEW" and logged to the event log as "config KEY OLD -> NEW".
 """
+import fcntl
 import os
 import re
 import subprocess
@@ -219,8 +220,13 @@ def write_settings(sets, resets=(), source="lg"):
 def log_event(text):
     try:
         os.makedirs(STATE, exist_ok=True)
-        with open(EVENTS, "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+        with open(os.path.join(STATE, "log.lock"), "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)  # the watchdog trims the log under this lock
+            except OSError:
+                pass
+            with open(EVENTS, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
     except OSError:
         pass
 

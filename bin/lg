@@ -5,7 +5,7 @@
 # https://github.com/Christian-Gennari/load-guard · MIT license
 # Config: ~/.config/load-guard.conf (shell KEY=VALUE lines, see config.example.conf).
 set -uo pipefail
-LG_VERSION=1.3.1
+LG_VERSION=1.4.0
 
 CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
 # shellcheck disable=SC1090
@@ -49,6 +49,7 @@ _w=$(( LG_MAX_HEAVY + 1 )); (( _w < 2 )) && _w=2; (( _w > 8 )) && _w=8
 : "${LG_POLL:=30}"                            # queue re-check seconds
 : "${LG_WAIT_MAX:=5400}"                      # max seconds to wait in a queue (90 min)
 : "${LG_STALE_HOURS:=8}"                      # worker registrations older than this are ignored
+: "${LG_KEEP_DAYS:=14}"                       # the watchdog deletes metrics and events older than this (days)
 : "${LG_METRICS_EVERY:=60}"                   # watchdog writes one metrics line this often (seconds)
 : "${LG_DASH_PORT:=8377}"                     # live dashboard port (lg dashboard)
 : "${LG_DASH_BIND:=127.0.0.1}"                # dashboard listen address
@@ -63,7 +64,20 @@ mkdir -p "$JOBS" "$WORKERS" "$SLOTS" "$QUEUE"
 
 EX_TEMPFAIL=75
 
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+log() { { flock -w 2 9; printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; } 9>>"$STATE/log.lock"; }
+
+# Keep LG_KEEP_DAYS of metrics and events. Only the watchdog writes metrics; event writers hold log.lock.
+trim_logs() {
+  local cut; cut=$(( $(date +%s) - LG_KEEP_DAYS * 86400 ))
+  if [[ -s $METRICS ]] && (( $(head -c 20 "$METRICS" | cut -d' ' -f1) < cut )) 2>/dev/null; then
+    awk -v c="$cut" '$1 >= c' "$METRICS" >"$METRICS.tmp" && mv -f "$METRICS.tmp" "$METRICS"
+  fi
+  local cutd; cutd=$(date -d "@$cut" '+%F %T')
+  if [[ -s $LOG && "$(head -c 19 "$LOG")" < "$cutd" ]]; then
+    { flock -w 10 9 && awk -v c="$cutd" 'substr($0, 1, 19) >= c' "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"; } 9>>"$STATE/log.lock"
+  fi
+  find "$STATE/killed" -type f -mtime +1 -delete 2>/dev/null
+}
 say() { printf 'load-guard: %s\n' "$*" >&2; }
 
 # ---- metrics ----
@@ -276,9 +290,10 @@ EOF
   fi
   mkdir -p "$STATE/killed"
   log "watchdog started (kill below $LG_KILL_FREE_GB GB free)"
-  local kill_kb newest f info last=0
+  local kill_kb newest f info last=0 trimmed=-3600
   kill_kb=$(gb_to_kb "$LG_KILL_FREE_GB")
   while :; do
+    if (( SECONDS - trimmed >= 3600 )); then trimmed=$SECONDS; trim_logs; fi
     if (( SECONDS - last >= LG_METRICS_EVERY )); then
       last=$SECONDS
       printf '%s %s %s %s %s %s %s %s\n' "$(date +%s)" "$(gb "$(free_kb)")" "$(gb "$(swap_used_kb)")" "$(load1)" "$(psi_mem)" "$(heavy_count)" "$(worker_count)" "$(runner_count)" >>"$METRICS"
