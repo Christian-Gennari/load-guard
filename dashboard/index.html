@@ -134,11 +134,13 @@ code { font-size: .88em; background: var(--sunken); border: 1px solid var(--bord
 @media (max-width: 760px) { .hero { grid-template-columns: auto minmax(0, 1fr); } .caps { grid-column: 1 / -1; flex-wrap: wrap; gap: 14px 28px; } }
 
 /* tiles */
-.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; }
 .tiles .tile { background: var(--sunken); box-shadow: none; border-radius: 10px; padding: 12px 14px 0; }
 .tiles .tile .spark { width: calc(100% + 28px); margin: auto -14px 0; }
 .tile { padding: 14px 16px 0; overflow: hidden; display: flex; flex-direction: column; }
 .tile-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-height: 22px; }
+.tile-top .chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 600px) { .tile .label { white-space: normal; } .tile-top { flex-direction: column; align-items: flex-start; gap: 4px; } .tiles .tile { padding: 11px 12px 0; } .tiles .tile .spark { width: calc(100% + 24px); margin: auto -12px 0; } }
 .tile .label { color: var(--ink2); font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; }
 .tile .value { font-size: var(--fs-num); font-weight: 600; line-height: 1.1; margin-top: 6px; letter-spacing: -.025em; }
 .tile .value small { font-size: var(--fs-md); font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 1px; }
@@ -246,6 +248,7 @@ td .folder { color: var(--muted); font-size: var(--fs-xs); margin-top: 1px; }
 .bars .bar { height: 10px; border-radius: 0 4px 4px 0; background: var(--s1); min-width: 2px; transition: width .5s; }
 .bars .val { text-align: right; white-space: nowrap; font-weight: 500; }
 .bars .val small { color: var(--muted); font-weight: 400; font-size: var(--fs-xs); }
+@media (max-width: 600px) { .bars .val small { display: block; line-height: 1.2; } }
 
 /* settings */
 #settings { display: none; }
@@ -848,7 +851,7 @@ function render(s) {
   push('free', free); push('psi', s.psi); push('load', s.load[0]); if (s.swap_rate != null) push('swap', s.swap_rate);
   setTile('free', free.toFixed(1), 'GB', 'of ' + gb(s.mem.total) + ' GB · ' + (free >= L.min_free_gb ? (free - L.min_free_gb).toFixed(1) + ' GB above the limit' : (L.min_free_gb - free).toFixed(1) + ' GB below the limit'),
     free < L.kill_free_gb ? ['crit', 'Critical'] : free < L.min_free_gb ? ['warn', 'Low'] : ['ok', 'OK']);
-  setTile('psi', s.psi.toFixed(2), '%', 'Time programs wait for memory · limit ' + L.max_psi + ' %', s.psi > L.max_psi ? ['warn', 'High'] : ['ok', 'OK']);
+  setTile('psi', s.psi.toFixed(2), '%', 'Time programs wait for memory · limit ' + L.max_psi + '\u00a0%', s.psi > L.max_psi ? ['warn', 'High'] : ['ok', 'OK']);
   setTile('load', s.load[0].toFixed(2), '', (s.cpu_pct == null ? '–' : s.cpu_pct.toFixed(0) + '%') + ' CPU · ' + s.cores + ' cores',
     s.load[0] > L.max_load ? ['crit', 'Workers wait'] : s.load[0] > L.heavy_max_load ? ['warn', 'Heavy jobs wait'] : ['ok', 'OK']);
   setTile('swap', s.swap_rate == null ? '–' : s.swap_rate.toFixed(1), 'MB/s', gb(s.mem.swap_used) + ' of ' + gb(s.mem.swap_total) + ' GB used',
@@ -905,7 +908,7 @@ function render(s) {
     const wrap = el('div'); wrap.append(bar); const name = el('div', 'name', p.name); name.title = p.name; top.append(name, wrap, val);
   }
 
-  $('foot').replaceChildren('Limits: ' + [pl(L.max_workers, 'worker'), pl(L.max_heavy, 'heavy job') + ' (' + L.max_heavy_total + ' with CI jobs)', L.min_free_gb + ' GB free memory to start work', 'load ' + L.heavy_max_load + ' for heavy jobs and ' + L.max_load + ' for workers', 'memory pressure ' + L.max_psi + ' %', L.job_mem + ' memory and ' + parseFloat(L.job_cpu) / 100 + ' cores for each heavy job', 'watchdog at ' + L.kill_free_gb + ' GB'].join(' · ') + '. Change them in ', el('code', '', '~/.config/load-guard.conf'), '.');
+  $('foot').replaceChildren('Limits: ' + [pl(L.max_workers, 'worker'), pl(L.max_heavy, 'heavy job') + ' (' + L.max_heavy_total + ' with CI jobs)', L.min_free_gb + ' GB free memory to start work', 'load ' + L.heavy_max_load + ' for heavy jobs and ' + L.max_load + ' for workers', 'memory pressure ' + L.max_psi + ' %', L.job_mem + ' memory and ' + parseFloat(L.job_cpu) / 100 + ' cores for each heavy job', 'watchdog at ' + L.kill_free_gb + ' GB'].join(' · ') + '. Change them in Settings or in ', el('code', '', '~/.config/load-guard.conf'), '.');
   commit(s); redraw();
   if (first) loadDay();
   $('conn').className = 'conn live'; $('conn-text').textContent = 'Live · ' + hhmm(s.t, true); document.body.classList.remove('offline');
