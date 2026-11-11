@@ -72,7 +72,7 @@ LG_EXCLUSIVE_MATCH='*dotnet test*'
 LG_EXCLUSIVE_UNLESS='*--filter*'
 ```
 
-The dashboard's "Last 24 hours" panel says when the limits are too tight or too loose. It has no login: keep it on `127.0.0.1` or use `--tailscale`.
+The dashboard's "Last 24 hours" panel says when the limits are too tight or too loose. It has no login: keep it on `127.0.0.1` or use `--tailscale`. Its Settings view changes these same keys in `~/.config/load-guard.conf`; it only writes when opened on `127.0.0.1` or `localhost`, and `LG_DASH_ALLOW_WRITE=1` allows changes from other addresses.
 
 ## License
 

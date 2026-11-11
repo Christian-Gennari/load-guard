@@ -10,14 +10,18 @@ GET /events       Server-Sent Events: "sample" every LG_DASH_INTERVAL s, "log" f
 GET /api/status   one sample as JSON
 GET /api/history  ?hours=N  the watchdog's one-per-minute metrics as JSON columns
 GET /api/recent   ?hours=N  finished heavy jobs and watchdog actions from the event log
+GET /api/settings           the editable limits and their defaults
+POST /api/settings          change or reset limits (only from localhost, demo never writes)
 
 Samples are taken only while a browser is connected, so an unwatched dashboard costs nothing.
 """
 import glob
+import hmac
 import json
 import os
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -31,6 +35,11 @@ LG = os.path.realpath(os.path.join(HERE, "..", "bin", "lg"))
 STATE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "load-guard")
 JOBS, WORKERS, QUEUE = (os.path.join(STATE, d) for d in ("jobs", "workers", "queue"))
 EVENTS, METRICS = os.path.join(STATE, "events.log"), os.path.join(STATE, "metrics.log")
+CONF = os.environ.get("LG_CONF") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "load-guard.conf")
+TOKEN = secrets.token_urlsafe(24)
+BIND = "127.0.0.1"
+LOCAL = ("127.0.0.1", "::1", "[::1]", "localhost")
 UID = os.getuid()
 CG_BASE = f"/sys/fs/cgroup/user.slice/user-{UID}.slice/user@{UID}.service"
 PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -53,21 +62,50 @@ def num(text):
         return None
 
 
-# ---- lg config (limits), re-read every 30 s ----
-_conf = {"at": 0.0, "v": {}}
+# ---- lg config (limits), re-read every 30 s or when the file changes ----
+_conf = {"at": 0.0, "mtime": None, "v": {}}
+_defaults = {"at": 0.0, "v": {}}
+
+
+def config_mtime():
+    try:
+        return os.stat(CONF).st_mtime_ns
+    except OSError:
+        return None
 
 
 def config():
     if DEMO:
         return {}
-    if time.time() - _conf["at"] > 30:
+    mtime = config_mtime()
+    if time.time() - _conf["at"] > 30 or mtime != _conf["mtime"]:
         try:
             out = subprocess.run([LG, "config"], capture_output=True, text=True, timeout=10).stdout
             _conf["v"] = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
         except (OSError, subprocess.SubprocessError):
             pass
-        _conf["at"] = time.time()
+        _conf["at"], _conf["mtime"] = time.time(), mtime
     return _conf["v"]
+
+
+def config_reset():
+    _conf["at"], _conf["mtime"] = 0.0, None
+
+
+def defaults():
+    """`lg config` as if no config file and no LG_* variable existed: the machine's own defaults."""
+    if DEMO:
+        return {}
+    if time.time() - _defaults["at"] > 300:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LG_")}
+        env["LG_CONF"] = "/dev/null"
+        try:
+            out = subprocess.run([LG, "config"], capture_output=True, text=True, timeout=10, env=env).stdout
+            _defaults["v"] = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _defaults["at"] = time.time()
+    return _defaults["v"]
 
 
 def cfg_num(key, default):
@@ -75,6 +113,177 @@ def cfg_num(key, default):
         return float(config().get(key, default))
     except ValueError:
         return float(default)
+
+
+# ---- settings: the limits people may change from the dashboard ----
+SETTINGS = [
+    ("LG_MAX_WORKERS", "Agents (workers) at once", "int", 1, 64),
+    ("LG_MIN_FREE_GB", "Free memory to admit an agent (GB)", "number", 0.5, 1024),
+    ("LG_MAX_LOAD", "Load limit to admit an agent", "number", 1, 4096),
+    ("LG_MAX_HEAVY", "Heavy jobs at once", "int", 1, 64),
+    ("LG_MAX_HEAVY_TOTAL", "Heavy jobs + CI jobs at once", "int", 1, 64),
+    ("LG_HEAVY_FREE_GB", "Free memory to start a heavy job (GB)", "number", 0.5, 1024),
+    ("LG_HEAVY_MAX_LOAD", "Load limit to start a heavy job", "number", 1, 4096),
+    ("LG_MAX_PSI", "Memory pressure limit (%)", "number", 1, 100),
+    ("LG_KILL_FREE_GB", "Watchdog stops the newest job below (GB)", "number", 0.1, 1024),
+    ("LG_JOB_MEM", "Memory limit per heavy job", "size"),
+    ("LG_JOB_CPU", "CPU limit per heavy job (100% = 1 core)", "percent"),
+    ("LG_EXCLUSIVE_MATCH", "Commands that run one at a time (glob)", "text"),
+    ("LG_EXCLUSIVE_UNLESS", "...except when they also match (glob)", "text"),
+]
+SPECS = {row[0]: row for row in SETTINGS}
+CONF_LINE_RE = re.compile(r"^\s*(LG_[A-Z_]+)=(.*)$")
+NUMBER_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+SIZE_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[KMGT]$")
+PERCENT_RE = re.compile(r"^[0-9]+%$")
+READONLY_NET = ("The dashboard is opened over the network. "
+                "Set LG_DASH_ALLOW_WRITE=1 in load-guard.conf to allow changes.")
+_save_lock = threading.Lock()
+
+
+def can_write(handler):
+    """Writes need localhost and no proxy in front, or LG_DASH_ALLOW_WRITE=1. Demo never writes."""
+    if DEMO:
+        return False
+    if config().get("LG_DASH_ALLOW_WRITE") == "1":
+        return True
+    if BIND not in LOCAL:
+        return False
+    if urlparse("//" + (handler.headers.get("Host") or "")).hostname not in LOCAL:
+        return False
+    return not any(handler.headers.get(h) for h in ("X-Forwarded-For", "X-Forwarded-Host", "Tailscale-User-Login"))
+
+
+def conf_value(raw):
+    """One config value: a quoted string as-is, otherwise up to a trailing ` # comment`."""
+    v = raw.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    return re.sub(r"\s+#.*$", "", v).rstrip()
+
+
+def file_values():
+    """The keys the config file sets, last occurrence wins. Comments do not count."""
+    values = {}
+    for line in read(CONF).splitlines():
+        m = CONF_LINE_RE.match(line)
+        if m:
+            values[m[1]] = conf_value(m[2])
+    return values
+
+
+def settings(handler):
+    if DEMO:
+        return demo.settings()
+    writable = can_write(handler)
+    values, defs, over = config(), defaults(), file_values()
+    items = []
+    for row in SETTINGS:
+        key = row[0]
+        item = {"key": key, "label": row[1], "type": row[2],
+                "value": values.get(key, defs.get(key, "")), "default": defs.get(key, ""),
+                "overridden": key in over}
+        if len(row) > 3:
+            item["min"], item["max"] = row[3], row[4]
+        items.append(item)
+    return {"writable": writable, "why_readonly": "" if writable else READONLY_NET,
+            "token": TOKEN if writable else None, "path": CONF, "items": items}
+
+
+def validate(key, value):
+    row = SPECS[key]
+    kind = row[2]
+    if kind == "int":
+        lo, hi = row[3], row[4]
+        if not re.match(r"^[0-9]+$", value):
+            return f"Use a whole number from {lo} to {hi}."
+        if not lo <= int(value) <= hi:
+            return f"Use a whole number from {lo} to {hi}."
+    elif kind == "number":
+        lo, hi = row[3], row[4]
+        if not NUMBER_RE.match(value):
+            return f"Use a number from {lo} to {hi}."
+        if not lo <= float(value) <= hi:
+            return f"Use a number from {lo} to {hi}."
+    elif kind == "size":
+        if not SIZE_RE.match(value):
+            return "Use a size like 4G or 512M."
+    elif kind == "percent":
+        if not PERCENT_RE.match(value):
+            return "Use a percentage like 400%."
+        if not 10 <= int(value[:-1]) <= 100000:
+            return "Use a percentage from 10 to 100000."
+    else:
+        if len(value) > 200:
+            return "Use 200 characters or fewer."
+        if any(c in value for c in ("\n", "\r", "'")):
+            return "Use plain text without quotes or line breaks."
+    return None
+
+
+def quote_value(value):
+    return "'" + value + "'" if re.search(r"[^A-Za-z0-9._%-]", value) else value
+
+
+def write_settings(sets, resets):
+    """Rewrite only the lines that belong to the changed keys; every other line stays as it was."""
+    try:
+        with open(CONF, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            lines = f.readlines()
+        mode = os.stat(CONF).st_mode & 0o777
+    except OSError:
+        lines, mode = [], 0o644
+
+    def hits(key):
+        return [i for i, line in enumerate(lines)
+                if CONF_LINE_RE.match(line) and CONF_LINE_RE.match(line)[1] == key]
+
+    appended = False
+    for key, value in sets.items():
+        new = f"{key}={quote_value(value)}"
+        found = hits(key)
+        if found:
+            last = found[-1]
+            lines[last] = new + lines[last][len(lines[last].rstrip("\r\n")):]
+            for i in reversed(found[:-1]):
+                del lines[i]
+        else:
+            if not appended:
+                if lines and not lines[-1].strip():
+                    pass
+                elif lines:
+                    if not lines[-1].endswith("\n"):
+                        lines[-1] += "\n"
+                    lines.append("\n")
+                lines.append("# set from the dashboard\n")
+                appended = True
+            lines.append(new + "\n")
+    for key in resets:
+        lines = [line for line in lines if not (CONF_LINE_RE.match(line) and CONF_LINE_RE.match(line)[1] == key)]
+
+    parent = os.path.dirname(os.path.abspath(CONF))
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{CONF}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.writelines(lines)
+        os.chmod(tmp, mode)
+        os.replace(tmp, CONF)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def log_event(text):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(EVENTS, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError:
+        pass
 
 
 # ---- one sample ----
@@ -403,6 +612,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def err(self, code, message):
+        self.reply(json.dumps({"error": message}).encode(), "application/json", code)
+
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/":
@@ -413,6 +625,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(f.read(), "font/woff2", cache="public, max-age=604800")
         elif url.path == "/api/status":
             self.reply(json.dumps(demo.sample() if DEMO else sample()).encode(), "application/json")
+        elif url.path == "/api/settings":
+            self.reply(json.dumps(settings(self)).encode(), "application/json")
         elif url.path in ("/api/history", "/api/recent"):
             try:
                 hours = min(48.0, max(0.1, float(parse_qs(url.query).get("hours", ["24"])[0])))
@@ -425,6 +639,93 @@ class Handler(BaseHTTPRequestHandler):
             self.stream()
         else:
             self.reply(b"not found\n", "text/plain", 404)
+
+    def do_POST(self):
+        if urlparse(self.path).path == "/api/settings":
+            self.post_settings()
+        else:
+            self.reply(b"not found\n", "text/plain", 404)
+
+    def post_settings(self):
+        if DEMO:
+            return self.err(403, "Demo data: changes are not saved.")
+        if not can_write(self):
+            return self.err(403, READONLY_NET)
+        token = (self.headers.get("X-LG-Token") or "").encode()
+        if not hmac.compare_digest(token, TOKEN.encode()):
+            return self.err(403, "The page is out of date. Reload the dashboard and try again.")
+        origin, host = self.headers.get("Origin"), (self.headers.get("Host") or "").lower()
+        if not origin or urlparse(origin).netloc.lower() != host:
+            return self.err(403, "The request came from another page.")
+
+        try:
+            size = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            size = 0
+        if size <= 0:
+            return self.err(400, "The request is empty.")
+        if size > 8192:
+            return self.err(400, "The request is too large.")
+        try:
+            body = json.loads(self.rfile.read(size))
+        except (OSError, ValueError):
+            return self.err(400, "The request is not valid JSON.")
+        if not isinstance(body, dict):
+            return self.err(400, "The request is not valid.")
+
+        sets_in, resets_in = body.get("set") or {}, body.get("reset") or []
+        if not isinstance(sets_in, dict) or not isinstance(resets_in, list):
+            return self.err(400, "The request is not valid.")
+        errors, sets, resets = {}, {}, []
+        for key, value in sets_in.items():
+            if key not in SPECS:
+                errors[str(key)] = "Unknown setting."
+            elif not isinstance(value, str):
+                errors[str(key)] = "Use text."
+            else:
+                message = validate(key, value)
+                if message:
+                    errors[key] = message
+                else:
+                    sets[key] = value
+        for key in resets_in:
+            if not isinstance(key, str) or key not in SPECS:
+                errors[str(key)] = "Unknown setting."
+            else:
+                resets.append(key)
+        for key in set(sets) & set(resets):
+            errors[key] = "Choose a value or a reset, not both."
+        if errors:
+            return self.reply(json.dumps({"errors": errors}).encode(), "application/json", 400)
+
+        def target(key):
+            if key in sets:
+                return sets[key]
+            if key in resets:
+                return defaults().get(key, config().get(key, ""))
+            return config().get(key, defaults().get(key, ""))
+        try:
+            heavy, total = int(target("LG_MAX_HEAVY")), int(target("LG_MAX_HEAVY_TOTAL"))
+        except (TypeError, ValueError):
+            heavy = total = None
+        if heavy is not None and total is not None and total < heavy:
+            errors["LG_MAX_HEAVY_TOTAL"] = f"Must be at least the number of heavy jobs ({heavy})."
+            return self.reply(json.dumps({"errors": errors}).encode(), "application/json", 400)
+
+        before = dict(config())
+        try:
+            with _save_lock:
+                write_settings(sets, resets)
+        except OSError:
+            return self.err(500, "Could not write the config file.")
+        config_reset()
+        after, defs = config(), defaults()
+        for key in list(sets) + resets:
+            old = before.get(key, "")
+            new = defs.get(key, "") if key in resets else after.get(key, "")
+            if new != old:
+                log_event(f"config {key} {old} -> {new}")
+        self.reply(json.dumps(settings(self)).encode(), "application/json")
 
     def stream(self):
         self.send_response(200)
@@ -462,8 +763,8 @@ if __name__ == "__main__":
     if DEMO:
         sys.path.insert(0, HERE)
         import demo  # noqa: E402
-    bind = arg("--bind", config().get("LG_DASH_BIND", "127.0.0.1"))
+    BIND = arg("--bind", config().get("LG_DASH_BIND", "127.0.0.1"))
     port = int(arg("--port", int(cfg_num("LG_DASH_PORT", 8377))))
     threading.Thread(target=HUB.run, daemon=True).start()
-    print(f"load guard dashboard{' (demo data)' if DEMO else ''} on http://{bind}:{port}/", flush=True)
-    Server((bind, port), Handler).serve_forever()
+    print(f"load guard dashboard{' (demo data)' if DEMO else ''} on http://{BIND}:{port}/", flush=True)
+    Server((BIND, port), Handler).serve_forever()

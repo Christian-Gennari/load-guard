@@ -94,6 +94,43 @@ def recent(hours):
     return {"jobs": out[-300:], "watchdog": []}
 
 
+DEMO_ITEMS = [
+    ("LG_MAX_WORKERS", "Agents (workers) at once", "int", 1, 64),
+    ("LG_MIN_FREE_GB", "Free memory to admit an agent (GB)", "number", 0.5, 1024),
+    ("LG_MAX_LOAD", "Load limit to admit an agent", "number", 1, 4096),
+    ("LG_MAX_HEAVY", "Heavy jobs at once", "int", 1, 64),
+    ("LG_MAX_HEAVY_TOTAL", "Heavy jobs + CI jobs at once", "int", 1, 64),
+    ("LG_HEAVY_FREE_GB", "Free memory to start a heavy job (GB)", "number", 0.5, 1024),
+    ("LG_HEAVY_MAX_LOAD", "Load limit to start a heavy job", "number", 1, 4096),
+    ("LG_MAX_PSI", "Memory pressure limit (%)", "number", 1, 100),
+    ("LG_KILL_FREE_GB", "Watchdog stops the newest job below (GB)", "number", 0.1, 1024),
+    ("LG_JOB_MEM", "Memory limit per heavy job", "size"),
+    ("LG_JOB_CPU", "CPU limit per heavy job (100% = 1 core)", "percent"),
+    ("LG_EXCLUSIVE_MATCH", "Commands that run one at a time (glob)", "text"),
+    ("LG_EXCLUSIVE_UNLESS", "...except when they also match (glob)", "text"),
+]
+DEMO_DEFAULTS = {"LG_MAX_WORKERS": "3", "LG_MIN_FREE_GB": "4", "LG_MAX_LOAD": "16", "LG_MAX_HEAVY": "2",
+                 "LG_MAX_HEAVY_TOTAL": "3", "LG_HEAVY_FREE_GB": "4", "LG_HEAVY_MAX_LOAD": "12",
+                 "LG_MAX_PSI": "5", "LG_KILL_FREE_GB": "1.5", "LG_JOB_MEM": "4G", "LG_JOB_CPU": "400%",
+                 "LG_EXCLUSIVE_MATCH": "", "LG_EXCLUSIVE_UNLESS": ""}
+DEMO_VALUES = dict(DEMO_DEFAULTS, LG_MAX_HEAVY="1", LG_MAX_HEAVY_TOTAL="2", LG_EXCLUSIVE_MATCH="*dotnet test*")
+DEMO_OVERRIDDEN = {"LG_MAX_HEAVY", "LG_EXCLUSIVE_MATCH"}
+
+
+def settings():
+    """The Settings view as a 16 GB / 12 core machine would show it, with two keys overridden."""
+    items = []
+    for row in DEMO_ITEMS:
+        key = row[0]
+        item = {"key": key, "label": row[1], "type": row[2], "value": DEMO_VALUES[key],
+                "default": DEMO_DEFAULTS[key], "overridden": key in DEMO_OVERRIDDEN}
+        if len(row) > 3:
+            item["min"], item["max"] = row[3], row[4]
+        items.append(item)
+    return {"writable": False, "why_readonly": "Demo data: changes are not saved.", "token": None,
+            "path": "~/.config/load-guard.conf", "items": items}
+
+
 def log_lines():
     lines = []
     for j in [j for j in recent(24)["jobs"] if j["end"] > time.time() - 5400]:
@@ -104,6 +141,7 @@ def log_lines():
     lines += [f"{ts(T0 - 2905)} admit ADMIT for=api-refactor",
               f"{ts(T0 - 2900)} worker start api-refactor task=Move the payments API to the new client",
               f"{ts(T0 - 1500)} admit WAIT for=ui-tests why=memory is low: 3.6 GB free, a new worker needs 4 GB",
+              f"{ts(T0 - 1200)} config LG_MAX_HEAVY 2 -> 1",
               f"{ts(T0 - 900)} admit OVERRIDE for=hotfix-login reason=Production login is down; the fix is one small test was=all 3 worker seats are taken (api-refactor, ui-tests, lint)",
               f"{ts(T0 - 615)} admit ADMIT for=docs-update",
               f"{ts(T0 - 610)} worker start docs-update task=Update the setup guide for the new CLI flags",
