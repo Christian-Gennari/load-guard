@@ -65,7 +65,7 @@ lg status                                             # the same verdict as the 
 
 ## Configuration
 
-Defaults come from the machine's memory and cores; `lg config` shows them. Override them in `~/.config/load-guard.conf` (every key: [`config.example.conf`](config.example.conf)). For example, to let only one full test suite run at a time:
+Defaults come from the machine's memory and cores; `lg config` shows them. After a day of use, `lg tune` suggests limits from what it measured, and `lg tune --apply` writes them. Override them in `~/.config/load-guard.conf` (every key: [`config.example.conf`](config.example.conf)). For example, to let only one full test suite run at a time:
 
 ```bash
 LG_EXCLUSIVE_MATCH='*dotnet test*'

@@ -30,9 +30,9 @@ Tool: `lg` (on PATH via `~/.local/bin/lg`; otherwise `bin/lg` in this skill's fo
 
 Defaults come from the machine (memory and core count) and can be changed in `~/.config/load-guard.conf` (see `config.example.conf`), not in the script. Run `lg config` to see them.
 
-## Tuning
+## Set up or tune the limits
 
-During a day of parallel work, check `lg report` now and then (the dashboard shows the same numbers under "Last 24 hours", with advice). At the end, decide from it: if free memory never went under ~5 GB and the watchdog never acted, try one more worker (`LG_MAX_WORKERS`); if it went under 3 GB or the watchdog acted, lower `LG_MAX_HEAVY` to 1. Write the change to `~/.config/load-guard.conf` and the evidence to `~/.config/load-guard.notes.md`.
+The defaults come from this machine's RAM and cores; `lg config` shows them and the installer prints them. When the user asks to configure or tune load guard, run `lg tune` (last 24 hours by default; `lg tune 72` for longer), show the suggestions, and run `lg tune --apply` when the user agrees. It needs about a day of normal use first. The changes go to `~/.config/load-guard.conf`, the same keys the dashboard Settings view edits.
 
 ## Orchestrator procedure
 

@@ -167,6 +167,14 @@ if [[ ! -f $conf ]]; then
   mkdir -p "$(dirname "$conf")"; cp "$HERE/config.example.conf" "$conf"; ok "created $(tilde "$conf") (all lines commented: defaults apply)"
 else ok "kept $(tilde "$conf")"; fi
 
+cfg=$("$HERE/bin/lg" config)
+conf_get() { printf '%s\n' "$cfg" | sed -n "s/^$1=//p"; }
+ram_gb=$(awk '/^MemTotal:/{printf "%.0f", $2/1048576}' /proc/meminfo)
+echo "Limits for this machine ($ram_gb GB RAM, $(nproc) cores; change them in the dashboard Settings or $(tilde "$conf"))"
+echo "  agents at once $(conf_get LG_MAX_WORKERS) · heavy jobs at once $(conf_get LG_MAX_HEAVY) · free memory to start $(conf_get LG_MIN_FREE_GB) GB"
+echo "  per heavy job $(conf_get LG_JOB_MEM) memory, $(conf_get LG_JOB_CPU) CPU · watchdog acts below $(conf_get LG_KILL_FREE_GB) GB free"
+echo "  After a day of normal use, run: lg tune"
+
 if (( links )); then
   echo; echo "Agent harnesses"
   while read -r d; do link_skill "$d"; done < <(skill_dirs)

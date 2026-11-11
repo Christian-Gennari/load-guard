@@ -12,12 +12,21 @@ CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
 [[ -f "$CONF" ]] && . "$CONF"
 
 # ---- defaults: only for keys that the config file or the environment did not set ----
-_cores=$(nproc)
-_ram_gb=$(awk '/^MemTotal:/{printf "%.1f", $2/1048576}' /proc/meminfo)
+_cores=${LG_TEST_CORES:-$(nproc)}
+_ram_gb=${LG_TEST_RAM_GB:-$(awk '/^MemTotal:/{printf "%.1f", $2/1048576}' /proc/meminfo)}
+unset LG_TEST_CORES LG_TEST_RAM_GB   # test-only overrides, not part of `lg config`
 _pick() { awk -v r="$_ram_gb" -v f="$1" -v lo="$2" -v hi="$3" 'BEGIN{v=r*f; if(v<lo)v=lo; if(v>hi)v=hi; printf "%g", int(v*2+0.5)/2}'; }
-: "${LG_MAX_WORKERS:=3}"                      # parallel workers (agents) at once
-: "${LG_MAX_HEAVY:=2}"                        # heavy jobs (lg run: builds, tests) at once, machine-wide
-: "${LG_MAX_HEAVY_TOTAL:=$((LG_MAX_HEAVY + 1))}"  # lg jobs + CI runner jobs at once
+_to_gb() { awk -v v="$1" 'BEGIN{u=toupper(substr(v,length(v),1)); n=v
+  if(u~/^[KMGT]$/){n=substr(v,1,length(v)-1)}else{u="G"}
+  m=(u=="K")?1/1048576:(u=="M")?1/1024:(u=="T")?1024:1
+  printf "%.4f", (n+0)*m}'; }
+_heavy_default() {
+  awk -v r="$_ram_gb" -v f="$LG_MIN_FREE_GB" -v j="$(_to_gb "$LG_JOB_MEM")" -v c="$_cores" 'BEGIN{
+    if (j <= 0) j = 1
+    cap = int(c / 4); if (cap < 1) cap = 1; if (cap > 8) cap = 8
+    n = int((r - f) / j); if (n < 1) n = 1; if (n > cap) n = cap
+    printf "%d", n}'
+}
 : "${LG_MIN_FREE_GB:=$(_pick 0.25 1 4)}"      # free memory (MemAvailable) to admit a worker
 : "${LG_HEAVY_FREE_GB:=$LG_MIN_FREE_GB}"      # free memory to start a heavy job
 : "${LG_KILL_FREE_GB:=$(_pick 0.1 0.5 1.5)}"  # watchdog stops the newest heavy job below this
@@ -25,6 +34,11 @@ _pick() { awk -v r="$_ram_gb" -v f="$1" -v lo="$2" -v hi="$3" 'BEGIN{v=r*f; if(v
 : "${LG_HEAVY_MAX_LOAD:=$_cores}"             # 1-min load ceiling to start a heavy job
 : "${LG_MAX_PSI:=5}"                          # memory pressure ceiling (% of time stalled, some avg10)
 : "${LG_JOB_MEM:=$(_pick 0.3 1 4)G}"          # MemoryMax per heavy job
+# The two concurrency limits follow from the machine, the memory a heavy job may take and the free-memory floor.
+: "${LG_MAX_HEAVY:=$(_heavy_default)}"        # heavy jobs (lg run: builds, tests) at once, machine-wide
+_w=$(( LG_MAX_HEAVY + 1 )); (( _w < 2 )) && _w=2; (( _w > 8 )) && _w=8
+: "${LG_MAX_WORKERS:=$_w}"                    # parallel workers (agents) at once
+: "${LG_MAX_HEAVY_TOTAL:=$((LG_MAX_HEAVY + 1))}"  # lg jobs + CI runner jobs at once
 : "${LG_JOB_SWAP:=256M}"                      # MemorySwapMax per heavy job (stops swap thrash)
 : "${LG_JOB_CPU:=$(( (_cores + 2) / 3 * 100 ))%}"  # CPUQuota per heavy job (100% = 1 core)
 : "${LG_JOB_NICE:=10}"
@@ -296,6 +310,166 @@ cmd_report() {  # [hours] — summary of metrics and jobs for tuning the limits
   echo "== heavy jobs (end events)"; grep ' end lg-' "$LOG" 2>/dev/null | tail -n 40
 }
 
+cmd_tune() {  # [hours] [--apply] — suggest limits from the last N hours of measurements and job history
+  local h=24 apply=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --apply) apply=1; shift;;
+      ''|*[!0-9]*) say "usage: lg tune [hours] [--apply]"; return 2;;
+      *) h=$1; shift;;
+    esac
+  done
+  (( 10#$h > 0 )) || { say "usage: lg tune [hours] [--apply]"; return 2; }
+  local dir; dir=$(dirname "$(dirname "$(readlink -f "$0")")")/dashboard
+  LG_MIN_FREE_GB=$LG_MIN_FREE_GB python3 - "$h" "$apply" "$METRICS" "$LOG" "$CONF" "$LG_JOB_MEM" "$LG_MAX_HEAVY" "$LG_MAX_WORKERS" "$_ram_gb" "$dir" <<'PY'
+import math, os, re, subprocess, sys, time
+
+hours = float(sys.argv[1])
+apply = sys.argv[2] == "1"
+metrics_path, log_path, conf_path = sys.argv[3:6]
+job_mem_raw, max_heavy, max_workers = sys.argv[6:9]
+ram_gb = float(sys.argv[9] or 0)
+dashboard = sys.argv[10]
+
+
+def to_gb(text):
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMGT]?)$", text.strip(), re.I)
+    if not m:
+        return 0.0
+    n, unit = float(m.group(1)), (m.group(2) or "G").upper()
+    return n / 1048576 if unit == "K" else n / 1024 if unit == "M" else n * 1024 if unit == "T" else n
+
+
+def fmt_gb(v):
+    return f"{int(v)}G" if abs(v - int(v)) < 1e-9 else f"{v:.1f}G"
+
+
+# ---- metrics: epoch free_gb swap_gb load1 psi heavy workers runners ----
+since = time.time() - hours * 3600
+free, parallel = [], []
+try:
+    with open(metrics_path, errors="replace") as f:
+        for line in f:
+            p = line.split()
+            if len(p) < 6:
+                continue
+            try:
+                t = float(p[0])
+                if t < since:
+                    continue
+                free.append(float(p[1]))
+                runners = int(float(p[7])) if len(p) > 7 else 0
+                parallel.append(int(float(p[5])) + runners)
+            except ValueError:
+                continue
+except OSError:
+    pass
+if len(free) < 60:
+    print(f"Not enough data yet: {len(free)} minutes of measurements. "
+          "Use the machine normally for a day, then run lg tune again.")
+    sys.exit(0)
+
+min_free, max_parallel = min(free), max(parallel)
+
+# ---- event log: finished jobs and watchdog actions ----
+stops = lows = jobs = hits = 0
+max_peak = 0
+job_mem_gb = to_gb(job_mem_raw)
+EV_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
+END_RE = re.compile(r" rc=(-?\d+) dur=\d+s peak=(\S+)")
+try:
+    with open(log_path, errors="replace") as f:
+        for line in f:
+            m = EV_RE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            try:
+                t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            if t < since:
+                continue
+            text = m.group(2)
+            if text.startswith("WATCHDOG stopped"):
+                stops += 1
+            elif text.startswith("WATCHDOG low"):
+                lows += 1
+            elif text.startswith("end lg-"):
+                e = END_RE.search(text)
+                if not e:
+                    continue
+                jobs += 1
+                rc = int(e.group(1))
+                peak = re.match(r"(\d+)MB$", e.group(2))
+                peak_mb = int(peak.group(1)) if peak else None
+                if peak_mb is not None:
+                    max_peak = max(max_peak, peak_mb)
+                if rc == 137 or (peak_mb is not None and peak_mb / 1024 >= job_mem_gb * 0.95):
+                    hits += 1
+except OSError:
+    pass
+
+# ---- suggestions ----
+sugg = []  # (key, now, suggested, why)
+cap = math.floor(ram_gb * 0.4 * 2) / 2  # 40% of RAM, rounded down to 0.5G
+# all heavy jobs at their limit must still leave the free-memory floor
+fit = math.floor((ram_gb - float(os.environ.get("LG_MIN_FREE_GB") or 0)) / max(1, int(max_heavy)) * 2) / 2
+if fit > 0:
+    cap = min(cap, fit) if cap > 0 else fit
+if hits:
+    new = min(to_gb(job_mem_raw) + 1, cap) if cap > 0 else to_gb(job_mem_raw) + 1
+    if abs(new - to_gb(job_mem_raw)) > 1e-9:
+        sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(new),
+                     f"{hits} job{'s' if hits != 1 else ''} hit the memory limit"))
+    else:
+        print(f"Note: {hits} job{'s' if hits != 1 else ''} hit the {job_mem_raw} memory limit, but {max_heavy} heavy jobs "
+              f"at a higher limit would not leave {os.environ.get('LG_MIN_FREE_GB')} GB free. "
+              "Run fewer heavy jobs at once (LG_MAX_HEAVY) or make those jobs smaller.")
+elif jobs >= 5:
+    new = math.ceil((max_peak / 1024) * 1.3 * 2) / 2
+    new = max(1.0, min(new, cap) if cap > 0 else new)
+    if abs(new - to_gb(job_mem_raw)) >= 0.5 - 1e-9:
+        sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(new),
+                     f"jobs peaked at {max_peak} MB; with 30 % headroom that is {fmt_gb(new)}"))
+
+low = stops > 0 or min_free < 3
+if low and int(max_heavy) > 1:
+    why = []
+    if stops:
+        why.append(f"{stops} watchdog stop{'s' if stops != 1 else ''}")
+    if min_free < 3:
+        why.append(f"free memory fell to {min_free:g} GB, below 3 GB")
+    sugg.append(("LG_MAX_HEAVY", str(int(max_heavy)), str(max(1, int(max_heavy) - 1)), "; ".join(why)))
+elif not low and min_free >= 5 and max_parallel >= 2 and stops == 0 and int(max_workers) < 8:
+    sugg.append(("LG_MAX_WORKERS", str(int(max_workers)), str(min(8, int(max_workers) + 1)),
+                 f"free memory stayed at {min_free:g} GB or more with {max_parallel} heavy jobs running"))
+
+# ---- output ----
+print(f"Last {hours:g}h: {len(free)} samples | min free {min_free:g} GB | "
+      f"max parallel heavy {max_parallel} (heavy + CI runners)")
+print(f"Watchdog: {stops} stops, {lows} low-memory warnings | finished jobs: {jobs}")
+print(f"Job memory: max peak {max_peak} MB | {hits} jobs hit the memory limit")
+if not sugg:
+    print(f"The limits fit the last {hours:g} hours. No change.")
+    sys.exit(0)
+print(f"{'setting':<14} {'now':>6} {'suggested':>10}  why")
+for key, now, new, why in sugg:
+    print(f"{key:<14} {now:>6} {new:>10}  {why}")
+if not apply:
+    print(f"Run lg tune --apply to write these to {conf_path}.")
+    sys.exit(0)
+sys.stdout.flush()
+r = subprocess.run([sys.executable, os.path.join(dashboard, "lgconf.py"), "set", "--source", "lg tune"] +
+                   [f"{key}={new}" for key, _, new, _ in sugg], capture_output=True, text=True)
+if r.returncode != 0:
+    sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+if r.stdout.strip():
+    print(r.stdout.strip())
+print(f"Wrote {len(sugg)} setting{'s' if len(sugg) != 1 else ''} to {conf_path}.")
+PY
+}
+
 dashboard_url() {
   local dns=""
   [[ $LG_DASH_BIND == 127.0.0.1 ]] && command -v tailscale >/dev/null && dns=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)
@@ -353,10 +527,11 @@ case ${1:-status} in
   watchdog) shift; cmd_watchdog "$@";;
   events)   shift; cmd_events "$@";;
   report)   shift; cmd_report "$@";;
+  tune)     shift; cmd_tune "$@";;
   dashboard) shift; cmd_dashboard "$@";;
   config)   for v in ${!LG_@}; do echo "$v=${!v}"; done;;
   version|--version) echo "lg $LG_VERSION";;
   rules)    cat "$(dirname "$(dirname "$(readlink -f "$0")")")/rules/load-guard-rules.md";;
-  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] [--for name] [--override reason] | worker start <name> [task]|end|touch|list | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
+  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] [--for name] [--override reason] | worker start <name> [task]|end|touch|list | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | tune [hours] [--apply] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
   *) say "unknown command: $1 (lg help)"; exit 2;;
 esac
