@@ -43,8 +43,8 @@ def sample():
         jobs.append({"unit": "lg-demo-" + slot, "slot": slot, "mem_limit": 4 * GB, "cpu": "400%", "cwd": cwd, "cmd": cmd,
                      "started": int(started), "mem_now": int(now * GB), "mem_peak": int(peak * 0.92 * GB),
                      "cores": round(2.6 + 0.9 * wave(t, 13, int(slot)), 2)})
-    workers = [{"name": "api-refactor", "since": int(T0 - 2900), "stale": False},
-               {"name": "docs-update", "since": int(T0 - 610), "stale": False}]
+    workers = [{"name": "api-refactor", "task": "Move the payments API to the new client", "since": int(T0 - 2900), "stale": False},
+               {"name": "docs-update", "task": "Update the setup guide for the new CLI flags", "since": int(T0 - 610), "stale": False}]
     queue = [{"pid": 1, "since": int(T0 - 18), "kind": "heavy", "why": "all 2 heavy slots busy",
               "cwd": "~/code/webapp/backend", "cmd": "dotnet build -m:2"}]
     top = [("node", 2.9, 24), ("dotnet", 2.2, 3), ("chrome", 1.4, 18), ("python3", 0.9, 9),
@@ -55,6 +55,7 @@ def sample():
         "mem": {"total": TOTAL, "free": int(f * GB), "swap_total": SWAP, "swap_used": int((1.3 + .1 * wave(t, 900)) * GB)},
         "load": [round(load(t), 2), round(load(t - 150), 2), round(load(t - 600), 2)],
         "cpu_pct": round(48 + 14 * wave(t, 23) + 6 * wave(t, 7), 1), "psi": round(max(0, .4 + .5 * wave(t, 60)), 2),
+        "swap_rate": round(max(0, .3 * wave(t, 45)), 2),
         "lg": {"free_gb": round(f, 1), "heavy": 2, "max_heavy": 2, "workers": 2, "max_workers": 3, "runners": 0,
                "max_heavy_total": 3, "admit_worker": True, "worker_wait": "", "admit_heavy": False,
                "heavy_wait": "all 2 heavy slots busy"},
@@ -100,7 +101,11 @@ def log_lines():
         lines.append(f"{ts(j['end'] - j['dur'])} start {j['unit']} slot=1 cwd={j['cwd']} cmd={j['cmd']}")
         lines.append(f"{ts(j['end'])} end {j['unit']} rc={j['rc']} dur={j['dur']}s peak={j['peak'] >> 20}MB cmd={j['cmd']}")
     ts = lambda x: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(x))
-    lines += [f"{ts(T0 - 2900)} worker start api-refactor", f"{ts(T0 - 610)} worker start docs-update",
+    lines += [f"{ts(T0 - 2905)} admit ADMIT for=api-refactor",
+              f"{ts(T0 - 2900)} worker start api-refactor task=Move the payments API to the new client",
+              f"{ts(T0 - 1500)} admit WAIT for=ui-tests why=free memory 3.6 GB < 4 GB",
+              f"{ts(T0 - 615)} admit ADMIT for=docs-update",
+              f"{ts(T0 - 610)} worker start docs-update task=Update the setup guide for the new CLI flags",
               f"{ts(T0 - 95)} start lg-demo-1 slot=1 cwd=~/code/webapp/frontend cmd={COMMANDS[0][0]}",
               f"{ts(T0 - 32)} start lg-demo-2 slot=2 cwd=~/code/webapp/frontend cmd={COMMANDS[3][0]}"]
     return sorted(lines)

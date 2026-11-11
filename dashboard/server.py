@@ -83,6 +83,20 @@ _cg_cache = {}
 _job_cpu = {}  # unit -> (cpu usage in usec, time) of the previous sample
 
 
+_swap_prev = None
+
+
+def swap_rate():
+    """MB/s swapped in + out since the last sample: real memory trouble, unlike swap used."""
+    global _swap_prev
+    v = dict(line.split() for line in read("/proc/vmstat").splitlines() if line.startswith(("pswpin ", "pswpout ")))
+    now, pages = time.time(), int(v.get("pswpin", 0)) + int(v.get("pswpout", 0))
+    prev, _swap_prev = _swap_prev, (now, pages)
+    if not prev or now <= prev[0]:
+        return None
+    return round((pages - prev[1]) * PAGE / 1048576 / (now - prev[0]), 2)
+
+
 def cpu_pct():
     global _cpu_prev
     parts = [int(x) for x in read("/proc/stat").split("\n", 1)[0].split()[1:9]]
@@ -152,7 +166,8 @@ def workers():
             since = os.path.getmtime(path)
         except OSError:
             continue
-        out.append({"name": os.path.basename(path)[:-2], "since": int(since), "stale": time.time() - since > stale})
+        out.append({"name": os.path.basename(path)[:-2], "task": read(path).strip().split("\n")[0], "since": int(since),
+                    "stale": time.time() - since > stale})
     return sorted(out, key=lambda w: w["since"])
 
 
@@ -213,7 +228,7 @@ def sample():
                 "swap_total": mem.get("SwapTotal", 0),
                 "swap_used": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)},
         "load": [float(x) for x in read("/proc/loadavg").split()[:3]],
-        "cpu_pct": cpu_pct(), "psi": float(psi[1]) if psi else 0.0,
+        "cpu_pct": cpu_pct(), "psi": float(psi[1]) if psi else 0.0, "swap_rate": swap_rate(),
         "lg": lg, "watchdog": watchdog,
         "limits": {
             "min_free_gb": cfg_num("LG_MIN_FREE_GB", 4), "heavy_free_gb": cfg_num("LG_HEAVY_FREE_GB", 4),

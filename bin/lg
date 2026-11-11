@@ -137,28 +137,32 @@ cmd_status() {
   if systemctl --user is-active --quiet load-guard-dashboard 2>/dev/null; then echo "dashboard: $(dashboard_url)"; fi
 }
 
-cmd_admit() {  # [--wait]
-  local wait=0; [[ ${1:-} == --wait ]] && wait=1
-  local start=$SECONDS why
+cmd_admit() {  # [--wait] [--for <worker name>] — each decision goes to the event log, so people can see it
+  local wait=0 for="" start=$SECONDS why logged=0
+  while [[ $# -gt 0 ]]; do case $1 in --wait) wait=1; shift;; --for) for=${2:-}; shift 2;; *) shift;; esac; done
   while ! why=$(check worker); do
-    if (( ! wait )); then echo "WAIT: $(echo "$why" | paste -sd';')"; return 1; fi
+    why=$(echo "$why" | paste -sd';')
+    (( logged )) || { log "admit WAIT for=${for:--} why=$why"; logged=1; }
+    if (( ! wait )); then echo "WAIT: $why"; return 1; fi
     if (( SECONDS - start > LG_WAIT_MAX )); then echo "TIMEOUT after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
-    queue_set worker "$why" "lg admit --wait"
-    say "queued worker: $(echo "$why" | paste -sd';')"; sleep "$LG_POLL"
+    queue_set worker "$why" "lg admit --wait${for:+ --for $for}"
+    say "queued worker: $why"; sleep "$LG_POLL"
   done
   queue_clear
+  log "admit ADMIT for=${for:--}"
   echo "ADMIT"
 }
 
-cmd_worker() {  # start|end|list <name>
-  local sub=${1:-list} name=${2:-}
+cmd_worker() {  # start <name> [task…] | end <name> | touch <name> | list
+  local sub=${1:-list} name=${2:-} task="${*:3}" f
   case $sub in
-    start) [[ -n $name ]] || { say "usage: lg worker start <name>"; return 2; }
-           touch "$WORKERS/$name.w"; log "worker start $name";;
+    start) [[ -n $name ]] || { say "usage: lg worker start <name> [task description]"; return 2; }
+           task=${task//[$'\n\t']/ }; printf '%s\n' "$task" >"$WORKERS/$name.w"
+           log "worker start $name${task:+ task=$task}";;
     end)   rm -f "$WORKERS/$name.w"; log "worker end $name";;
     touch) touch "$WORKERS/$name.w";;
-    list)  ls -1 "$WORKERS" 2>/dev/null | sed 's/\.w$//';;
-    *) say "usage: lg worker start|end|touch|list <name>"; return 2;;
+    list)  for f in "$WORKERS"/*.w; do [[ -e $f ]] && printf '%s\t%s\n' "$(basename "$f" .w)" "$(head -1 "$f")"; done;;
+    *) say "usage: lg worker start <name> [task] | end <name> | touch <name> | list"; return 2;;
   esac
 }
 
@@ -343,6 +347,6 @@ case ${1:-status} in
   config)   for v in ${!LG_@}; do echo "$v=${!v}"; done;;
   version|--version) echo "lg $LG_VERSION";;
   rules)    cat "$(dirname "$(dirname "$(readlink -f "$0")")")/rules/load-guard-rules.md";;
-  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] | worker start|end|touch|list <name> | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
+  -h|--help|help) sed -n '2,4p' "$0" | cut -c3-; echo "commands: status [--json] | admit [--wait] [--for name] | worker start <name> [task]|end|touch|list | run [--mem X] [--cpu Y%] -- cmd | watchdog [--install] | events [-f|N] | report [hours] | dashboard [--install [--tailscale]|--uninstall|--url|--demo] | rules | config | version";;
   *) say "unknown command: $1 (lg help)"; exit 2;;
 esac
