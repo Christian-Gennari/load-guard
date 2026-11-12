@@ -108,11 +108,13 @@ DEMO_ITEMS = [
     ("LG_JOB_CPU", "CPU limit per heavy job (100% = 1 core)", "percent"),
     ("LG_EXCLUSIVE_MATCH", "Commands that run one at a time (glob)", "text"),
     ("LG_EXCLUSIVE_UNLESS", "...except when they also match (glob)", "text"),
+    ("LG_EXCLUSIVE_MEM", "Memory limit of a one-at-a-time job (takes more slots)", "size"),
 ]
 DEMO_DEFAULTS = {"LG_MAX_WORKERS": "3", "LG_MIN_FREE_GB": "4", "LG_MAX_LOAD": "16", "LG_MAX_HEAVY": "2",
                  "LG_MAX_HEAVY_TOTAL": "3", "LG_HEAVY_FREE_GB": "4", "LG_HEAVY_MAX_LOAD": "12",
                  "LG_MAX_PSI": "5", "LG_KILL_FREE_GB": "1.5", "LG_JOB_MEM": "4G", "LG_JOB_CPU": "400%",
-                 "LG_EXCLUSIVE_MATCH": "", "LG_EXCLUSIVE_UNLESS": ""}
+                 "LG_EXCLUSIVE_MATCH": "", "LG_EXCLUSIVE_UNLESS": "",
+                 "LG_EXCLUSIVE_MEM": "4G"}
 DEMO_VALUES = dict(DEMO_DEFAULTS, LG_MAX_HEAVY="1", LG_MAX_HEAVY_TOTAL="2", LG_EXCLUSIVE_MATCH="*dotnet test*")
 DEMO_OVERRIDDEN = {"LG_MAX_HEAVY", "LG_EXCLUSIVE_MATCH"}
 

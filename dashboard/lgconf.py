@@ -103,6 +103,7 @@ SETTINGS = [
     ("LG_JOB_CPU", "CPU limit per heavy job (100% = 1 core)", "percent"),
     ("LG_EXCLUSIVE_MATCH", "Commands that run one at a time (glob)", "text"),
     ("LG_EXCLUSIVE_UNLESS", "...except when they also match (glob)", "text"),
+    ("LG_EXCLUSIVE_MEM", "Memory limit of a one-at-a-time job (takes more slots)", "size"),
 ]
 SPECS = {row[0]: row for row in SETTINGS}
 CONF_LINE_RE = re.compile(r"^\s*(LG_[A-Z_]+)=(.*)$")

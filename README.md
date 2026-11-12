@@ -70,7 +70,10 @@ Defaults come from the machine's memory and cores; `lg config` shows them. After
 ```bash
 LG_EXCLUSIVE_MATCH='*dotnet test*'
 LG_EXCLUSIVE_UNLESS='*--filter*'
+LG_EXCLUSIVE_MEM=6G   # its own memory limit
 ```
+
+Each slot stands for `LG_JOB_MEM` of memory, and `LG_MAX_HEAVY` slots × `LG_JOB_MEM` leave `LG_MIN_FREE_GB` free. A job with a larger limit (`LG_EXCLUSIVE_MEM`, or `lg run --mem`) takes as many slots as its limit needs, so with 3 slots of 3.5G a 6G full test suite takes 2 of them. More small jobs can run side by side, and the one big job still fits. `lg tune` keeps the slot count and the limits in this budget.
 
 The dashboard's "Last 24 hours" panel says when the limits are too tight or too loose. It has no login: keep it on `127.0.0.1` or use `--tailscale`. Its Settings view changes these same keys in `~/.config/load-guard.conf`; it only writes when opened on `127.0.0.1` or `localhost`, and `LG_DASH_ALLOW_WRITE=1` allows changes from other addresses.
 

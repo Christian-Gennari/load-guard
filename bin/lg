@@ -5,7 +5,7 @@
 # https://github.com/Christian-Gennari/load-guard · MIT license
 # Config: ~/.config/load-guard.conf (shell KEY=VALUE lines, see config.example.conf).
 set -uo pipefail
-LG_VERSION=1.4.0
+LG_VERSION=1.5.0
 
 CONF="${LG_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/load-guard.conf}"
 # shellcheck disable=SC1090
@@ -43,6 +43,8 @@ _w=$(( LG_MAX_HEAVY + 1 )); (( _w < 2 )) && _w=2; (( _w > 8 )) && _w=8
 : "${LG_JOB_CPU:=$(( (_cores + 2) / 3 * 100 ))%}"  # CPUQuota per heavy job (100% = 1 core)
 : "${LG_JOB_NICE:=10}"
 : "${LG_EXCLUSIVE_MATCH:=}"                   # glob: commands that may run only one at a time (e.g. '*dotnet test*')
+_excl_mem_set=$([[ -n ${LG_EXCLUSIVE_MEM:-} ]] && echo 1 || echo 0)
+: "${LG_EXCLUSIVE_MEM:=$LG_JOB_MEM}"           # MemoryMax of an exclusive job; it takes LG_EXCLUSIVE_MEM / LG_JOB_MEM slots
 : "${LG_EXCLUSIVE_UNLESS:=}"                  # glob: ... except when they also match this (e.g. '*--filter*')
 : "${LG_CI_PROCESS:=Runner.Worker}"           # process name of a CI job (GitHub Actions self-hosted runner)
 : "${LG_WATCH_INTERVAL:=10}"                  # watchdog poll seconds
@@ -98,7 +100,22 @@ prune_jobs() {
     systemctl --user is-active --quiet "$unit.scope" 2>/dev/null || rm -f "$f"
   done
 }
-heavy_count() { prune_jobs; find "$JOBS" -name '*.job' | wc -l; }
+# Slots in use: a job file says slot=1, or slot=1+2 for a job that takes two slots.
+heavy_count() {
+  prune_jobs
+  local f s n=0
+  for f in "$JOBS"/*.job; do
+    [[ -e $f ]] || continue
+    s=$(sed -n '1s/^[^ ]* slot=\([^ ]*\) .*/\1/p' "$f"); s=${s//[!+]/}
+    n=$(( n + ${#s} + 1 ))
+  done
+  # slots that a waiting multi-slot job already holds (held.<pid> = how many)
+  for f in "$SLOTS"/held.*; do
+    [[ -e $f ]] || continue
+    if kill -0 "${f##*.}" 2>/dev/null; then n=$(( n + $(cat "$f" 2>/dev/null || echo 0) )); else rm -f "$f"; fi
+  done
+  echo "$n"
+}
 # CI jobs on this machine (for example self-hosted GitHub Actions runners) count as heavy jobs.
 runner_count() { [[ -n $LG_CI_PROCESS ]] || { echo 0; return; }; pgrep -c -x "$LG_CI_PROCESS" 2>/dev/null || true; }
 worker_count() {
@@ -139,7 +156,7 @@ check_heavy_now() {
 # ---- queue registry: one file per waiting lg process, shown by the dashboard ----
 QSINCE=""
 queue_set() {  # kind(worker|heavy) reasons command
-  [[ -n $QSINCE ]] || { QSINCE=$(date +%s); trap 'rm -f "$QUEUE/$$.q"' EXIT; }
+  [[ -n $QSINCE ]] || { QSINCE=$(date +%s); trap 'rm -f "$QUEUE/$$.q" "$SLOTS/held.$$"' EXIT; }
   printf '%s\t%s\t%s\t%s\t%s\n' "$QSINCE" "$1" "$(echo "$2" | paste -sd';')" "$PWD" "$3" >"$QUEUE/$$.q"
 }
 queue_clear() { rm -f "$QUEUE/$$.q"; }
@@ -205,20 +222,22 @@ cmd_worker() {  # start <name> [task…] | end <name> | touch <name> | list
 }
 
 cmd_run() {  # [--mem X] [--cpu Y%] [--] cmd...
-  local mem=$LG_JOB_MEM cpu=$LG_JOB_CPU
+  local mem=$LG_JOB_MEM cpu=$LG_JOB_CPU mem_set=0
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --mem) mem=$2; shift 2;; --cpu) cpu=$2; shift 2;;
+      --mem) mem=$2; mem_set=1; shift 2;; --cpu) cpu=$2; shift 2;;
       --) shift; break;; *) break;;
     esac
   done
   [[ $# -gt 0 ]] || { say "usage: lg run [--mem 3G] [--cpu 400%] -- <command...>"; return 2; }
 
-  local start=$SECONDS fd slot="" i why sfd=""
+  local start=$SECONDS fd slot="" i why sfd="" need
+  local -a slots=() fds=()
   local cmdline="${*//[$'\n\t']/ }"   # one line for the job file, the event log and the queue
   # Commands that match LG_EXCLUSIVE_MATCH (for example a full test suite) run one at a time machine-wide.
   # shellcheck disable=SC2053
   if [[ -n $LG_EXCLUSIVE_MATCH && $cmdline == $LG_EXCLUSIVE_MATCH && ( -z $LG_EXCLUSIVE_UNLESS || $cmdline != $LG_EXCLUSIVE_UNLESS ) ]]; then
+    (( mem_set )) || mem=$LG_EXCLUSIVE_MEM
     exec {sfd}>"$SLOTS/exclusive.lock"
     until flock -n "$sfd"; do
       if (( SECONDS - start > LG_WAIT_MAX )); then say "gave up after ${LG_WAIT_MAX}s: another exclusive job runs"; return $EX_TEMPFAIL; fi
@@ -226,21 +245,29 @@ cmd_run() {  # [--mem X] [--cpu Y%] [--] cmd...
       say "queued: another exclusive job runs (LG_EXCLUSIVE_MATCH) — retry in ${LG_POLL}s"; sleep "$LG_POLL"
     done
   fi
+  # Each slot stands for LG_JOB_MEM of memory: a job with a larger limit takes more slots, so the
+  # limits of all running jobs together never exceed LG_MAX_HEAVY x LG_JOB_MEM.
+  need=$(awk -v m="$(_to_gb "$mem")" -v j="$(_to_gb "$LG_JOB_MEM")" -v n="$LG_MAX_HEAVY" 'BEGIN{
+    k = (j > 0) ? int(m / j) : 1; if (j > 0 && k * j < m - 1e-9) k++; if (k < 1) k = 1; if (k > n) k = n; print k}')
   while :; do
     if why=$(check heavy); then
-      for ((i = 1; i <= LG_MAX_HEAVY; i++)); do
+      # Keep the slots already taken while waiting for the rest, so a big job is not starved by small ones.
+      for ((i = 1; i <= LG_MAX_HEAVY && ${#slots[@]} < need; i++)); do
+        [[ " ${slots[*]} " == *" $i "* ]] && continue
         exec {fd}>"$SLOTS/$i.lock"
-        if flock -n "$fd"; then slot=$i; break; fi
-        exec {fd}>&-
+        if flock -n "$fd"; then slots+=("$i"); fds+=("$fd"); else exec {fd}>&-; fi
       done
-      [[ -n $slot ]] && break
-      why="all $LG_MAX_HEAVY build and test slots are in use"
+      (( ${#slots[@]} >= need )) && { rm -f "$SLOTS/held.$$"; break; }
+      if (( ${#slots[@]} )); then echo "${#slots[@]}" >"$SLOTS/held.$$"; fi
+      if (( need > 1 )); then why="this job needs $need of the $LG_MAX_HEAVY build and test slots (memory $mem); it holds ${#slots[@]}"
+      else why="all $LG_MAX_HEAVY build and test slots are in use"; fi
     fi
     if (( SECONDS - start > LG_WAIT_MAX )); then say "gave up after ${LG_WAIT_MAX}s: $why"; return $EX_TEMPFAIL; fi
     queue_set heavy "$why" "$cmdline"
     say "queued: $(echo "$why" | paste -sd';') — retry in ${LG_POLL}s"; sleep "$LG_POLL"
   done
   queue_clear
+  slot=$(printf '%s\n' "${slots[@]}" | sort -n | paste -sd+)
 
   local unit="lg-$(date +%s)-$RANDOM" t0=$SECONDS peakf="$STATE/peak.$$"
   printf '%s slot=%s mem=%s cpu=%s cwd=%s cmd=%s\n' "$(date '+%H:%M:%S')" "$slot" "$mem" "$cpu" "$PWD" "$cmdline" >"$JOBS/$unit.job"
@@ -253,7 +280,7 @@ cmd_run() {  # [--mem X] [--cpu Y%] [--] cmd...
   local rc=$? peak="limit"
   [[ -s $peakf ]] && peak="$(( $(cat "$peakf") / 1048576 ))MB"; rm -f "$peakf"
   local stats="rc=$rc dur=$((SECONDS - t0))s peak=$peak"
-  flock -u "$fd"; exec {fd}>&-
+  for fd in "${fds[@]}"; do flock -u "$fd"; exec {fd}>&-; done
   [[ -n $sfd ]] && { flock -u "$sfd"; exec {sfd}>&-; }
   rm -f "$JOBS/$unit.job"
   if [[ -f "$STATE/killed/$unit" ]]; then
@@ -336,8 +363,10 @@ cmd_tune() {  # [hours] [--apply] — suggest limits from the last N hours of me
   done
   (( 10#$h > 0 )) || { say "usage: lg tune [hours] [--apply]"; return 2; }
   local dir; dir=$(dirname "$(dirname "$(readlink -f "$0")")")/dashboard
-  LG_MIN_FREE_GB=$LG_MIN_FREE_GB LG_HEAVY_FREE_GB=$LG_HEAVY_FREE_GB LG_CORES=$_cores python3 - "$h" "$apply" "$METRICS" "$LOG" "$CONF" "$LG_JOB_MEM" "$LG_MAX_HEAVY" "$LG_MAX_WORKERS" "$_ram_gb" "$dir" <<'PY'
-import math, os, re, subprocess, sys, time
+  LG_MIN_FREE_GB=$LG_MIN_FREE_GB LG_HEAVY_FREE_GB=$LG_HEAVY_FREE_GB LG_CORES=$_cores \
+    LG_EXCLUSIVE_MATCH=$LG_EXCLUSIVE_MATCH LG_EXCLUSIVE_UNLESS=$LG_EXCLUSIVE_UNLESS \
+    LG_EXCLUSIVE_MEM=$LG_EXCLUSIVE_MEM LG_EXCLUSIVE_MEM_SET=$_excl_mem_set python3 - "$h" "$apply" "$METRICS" "$LOG" "$CONF" "$LG_JOB_MEM" "$LG_MAX_HEAVY" "$LG_MAX_WORKERS" "$_ram_gb" "$dir" <<'PY'
+import fnmatch, math, os, re, subprocess, sys, time
 
 hours = float(sys.argv[1])
 apply = sys.argv[2] == "1"
@@ -389,11 +418,25 @@ if len(free) < 60:
 min_free, max_parallel = min(free), max(parallel)
 
 # ---- event log: finished jobs and watchdog actions ----
-stops = lows = jobs = hits = 0
-max_peak = 0
-job_mem_gb = to_gb(job_mem_raw)
+# Exclusive jobs (LG_EXCLUSIVE_MATCH, for example a full test suite) run one at a time with their own
+# limit, so their peaks are kept apart from the normal jobs that share the slots.
+excl_match = os.environ.get("LG_EXCLUSIVE_MATCH") or ""
+excl_unless = os.environ.get("LG_EXCLUSIVE_UNLESS") or ""
+excl_mem_raw = os.environ.get("LG_EXCLUSIVE_MEM") or job_mem_raw
+excl_explicit = os.environ.get("LG_EXCLUSIVE_MEM_SET") == "1"
+
+
+def is_excl(cmd):
+    return bool(excl_match) and fnmatch.fnmatchcase(cmd, excl_match) and not (
+        excl_unless and fnmatch.fnmatchcase(cmd, excl_unless))
+
+
+stops = lows = jobs = 0
+peaks = {False: [], True: []}  # is exclusive -> peak MB
+hits = {False: 0, True: 0}
+job_mem_gb, excl_mem_gb = to_gb(job_mem_raw), to_gb(excl_mem_raw)
 EV_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
-END_RE = re.compile(r" rc=(-?\d+) dur=\d+s peak=(\S+)")
+END_RE = re.compile(r" rc=(-?\d+) dur=\d+s peak=(\S+)(?:.*? cmd=(.*))?$")
 try:
     with open(log_path, errors="replace") as f:
         for line in f:
@@ -416,58 +459,111 @@ try:
                 if not e:
                     continue
                 jobs += 1
+                ex = is_excl(e.group(3) or "")
                 rc = int(e.group(1))
                 peak = re.match(r"(\d+)MB$", e.group(2))
                 peak_mb = int(peak.group(1)) if peak else None
                 if peak_mb is not None:
-                    max_peak = max(max_peak, peak_mb)
-                if rc == 137 or (peak_mb is not None and peak_mb / 1024 >= job_mem_gb * 0.95):
-                    hits += 1
+                    peaks[ex].append(peak_mb)
+                limit = excl_mem_gb if ex else job_mem_gb
+                if rc == 137 or (peak_mb is not None and peak_mb / 1024 >= limit * 0.95):
+                    hits[ex] += 1
 except OSError:
     pass
 
-# ---- suggestions ----
-sugg = []  # (key, now, suggested, why)
-cap = math.floor(ram_gb * 0.4 * 2) / 2  # 40% of RAM, rounded down to 0.5G
-# all heavy jobs at their limit must still leave the free-memory floor
-fit = math.floor((ram_gb - float(os.environ.get("LG_MIN_FREE_GB") or 0)) / max(1, int(max_heavy)) * 2) / 2
-if fit > 0:
-    cap = min(cap, fit) if cap > 0 else fit
-if hits:
-    new = min(to_gb(job_mem_raw) + 1, cap) if cap > 0 else to_gb(job_mem_raw) + 1
-    if abs(new - to_gb(job_mem_raw)) > 1e-9:
-        sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(new),
-                     f"{hits} job{'s' if hits != 1 else ''} hit the memory limit"))
-    else:
-        print(f"Note: {hits} job{'s' if hits != 1 else ''} hit the {job_mem_raw} memory limit, but {max_heavy} heavy jobs "
-              f"at a higher limit would not leave {os.environ.get('LG_MIN_FREE_GB')} GB free. "
-              "Run fewer heavy jobs at once (LG_MAX_HEAVY) or make those jobs smaller.")
-elif jobs >= 5:
-    new = math.ceil((max_peak / 1024) * 1.3 * 2) / 2
-    new = max(1.0, min(new, cap) if cap > 0 else new)
-    if abs(new - to_gb(job_mem_raw)) >= 0.5 - 1e-9:
-        sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(new),
-                     f"jobs peaked at {max_peak} MB; with 30 % headroom that is {fmt_gb(new)}"))
 
-heavy_free = float(os.environ.get("LG_HEAVY_FREE_GB") or os.environ.get("LG_MIN_FREE_GB") or 0)
+def ceil_half(v):
+    return math.ceil(v * 2 - 1e-9) / 2
+
+
+def floor_half(v):
+    return math.floor(v * 2 + 1e-9) / 2
+
+
+def pct(values, q):
+    v = sorted(values)
+    return v[min(len(v) - 1, int(len(v) * q))] if v else 0
+
+
+# ---- suggestions: one plan in which the numbers fit together ----
+# Budget: LG_MAX_HEAVY slots x LG_JOB_MEM must leave LG_MIN_FREE_GB free. A job with a larger limit
+# (an exclusive job at LG_EXCLUSIVE_MEM) takes as many slots as its limit needs, so this always holds.
+sugg = []  # (key, now, suggested, why)
+notes = []
+n_now = int(max_heavy)
+floor_gb = float(os.environ.get("LG_MIN_FREE_GB") or 0)
+budget = ram_gb - floor_gb
+normal, excl = peaks[False], peaks[True]
+heavy_free = float(os.environ.get("LG_HEAVY_FREE_GB") or floor_gb)
 heavy_cap = min(8, max(1, int(os.environ.get("LG_CORES") or 1) // 4))  # same core cap as the default
+
+# 1. slots
 low = stops > 0 or min_free < 3
-if low and int(max_heavy) > 1:
+n = n_now
+if low and n_now > 1:
     why = []
     if stops:
         why.append(f"{stops} watchdog stop{'s' if stops != 1 else ''}")
     if min_free < 3:
         why.append(f"free memory fell to {min_free:g} GB, below 3 GB")
-    sugg.append(("LG_MAX_HEAVY", str(int(max_heavy)), str(max(1, int(max_heavy) - 1)), "; ".join(why)))
-elif (not low and len(free_full) >= len(free) * 0.1 and int(max_heavy) < heavy_cap
-      and sum(free_full) / len(free_full) >= heavy_free + 2):
-    # slots were often all taken while memory sat free: one more slot. A job in it still starts only
-    # with LG_HEAVY_FREE_GB free, and the watchdog still stops the newest job when memory runs low.
+    n = n_now - 1
+    sugg.append(("LG_MAX_HEAVY", str(n_now), str(n), "; ".join(why)))
+elif not low and free_full and len(free_full) >= len(free) * 0.1 and n_now < heavy_cap \
+        and sum(free_full) / len(free_full) >= heavy_free + 2:
+    # Slots were often all taken while memory sat free. One more slot only when most normal jobs
+    # (90th percentile, 30 % headroom) still fit in the smaller share of the budget each slot gets.
+    p90 = ceil_half(pct(normal, 0.9) / 1024 * 1.3) if len(normal) >= 5 else 1.0
+    share = floor_half(budget / (n_now + 1))
     avg = sum(free_full) / len(free_full)
-    sugg.append(("LG_MAX_HEAVY", str(int(max_heavy)), str(int(max_heavy) + 1),
-                 f"all {int(max_heavy)} slots were in use {100 * len(free_full) / len(free):.0f} % of the time "
-                 f"with {avg:.1f} GB free on average"))
-elif not low and min_free >= 5 and max_parallel >= 2 and stops == 0 and int(max_workers) < 8:
+    if share >= max(1.0, p90):
+        n = n_now + 1
+        sugg.append(("LG_MAX_HEAVY", str(n_now), str(n),
+                     f"all {n_now} slots were in use {100 * len(free_full) / len(free):.0f} % of the time "
+                     f"with {avg:.1f} GB free on average"))
+    else:
+        notes.append(f"All {n_now} slots were often in use, but {n_now + 1} slots would give each job only "
+                     f"{fmt_gb(share)}; most jobs need {fmt_gb(p90)}.")
+
+# 2. memory per normal job: what the jobs used, but never more than the slot's share of the budget
+share = floor_half(budget / n) if budget > 0 else 0
+job_new = job_mem_gb
+why = []
+if hits[False]:
+    job_new = job_mem_gb + 1
+    why.append(f"{hits[False]} job{'s' if hits[False] != 1 else ''} hit the memory limit")
+elif len(normal) >= 5:
+    job_new = ceil_half(max(normal) / 1024 * 1.3)
+    why.append(f"jobs peaked at {max(normal)} MB; with 30 % headroom that is {fmt_gb(job_new)}")
+if share >= 1 and job_new > share:
+    over = sum(1 for p in normal if p / 1024 > share * 0.95)
+    if over:
+        notes.append(f"{over} of {len(normal)} jobs peaked near or above {fmt_gb(share)}. "
+                     f"With {n} slots they may hit the limit. Run narrower tests, or fewer slots.")
+    job_new = share
+    why = [f"{n} slots x {fmt_gb(share)} must leave {floor_gb:g} GB of {ram_gb:g} GB free"]
+job_new = max(1.0, job_new)
+if abs(job_new - job_mem_gb) >= 0.5 - 1e-9 or job_mem_gb > share >= 1:
+    sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(job_new), "; ".join(why)))
+
+# 3. memory per exclusive job: it runs alone and takes several slots, up to all of them
+if excl_match and (excl or excl_explicit):
+    excl_new = excl_mem_gb
+    why = ""
+    if hits[True]:
+        excl_new = excl_mem_gb + 1
+        why = f"{hits[True]} full run{'s' if hits[True] != 1 else ''} hit the memory limit"
+    elif excl:
+        excl_new = ceil_half(max(excl) / 1024 * 1.3)
+        why = f"full runs peaked at {max(excl)} MB; with 30 % headroom that is {fmt_gb(excl_new)}"
+    excl_new = max(job_new, min(excl_new, n * job_new))
+    after = excl_mem_gb if excl_explicit else job_new  # the value it has after these changes
+    if abs(excl_new - after) >= 0.5 - 1e-9 or (not excl_explicit and excl_new != job_mem_gb):
+        k = math.ceil(excl_new / job_new - 1e-9)
+        sugg.append(("LG_EXCLUSIVE_MEM", excl_mem_raw, fmt_gb(excl_new),
+                     f"{why + '; ' if why else ''}it takes {k} of {n} slots while it runs"))
+
+if not any(k == "LG_MAX_HEAVY" for k, *_ in sugg) and not low and min_free >= 5 and max_parallel >= 2 \
+        and stops == 0 and int(max_workers) < 8:
     sugg.append(("LG_MAX_WORKERS", str(int(max_workers)), str(min(8, int(max_workers) + 1)),
                  f"free memory stayed at {min_free:g} GB or more with {max_parallel} heavy jobs running"))
 
@@ -475,7 +571,11 @@ elif not low and min_free >= 5 and max_parallel >= 2 and stops == 0 and int(max_
 print(f"Last {hours:g}h: {len(free)} samples | min free {min_free:g} GB | "
       f"max parallel heavy {max_parallel} (heavy + CI runners)")
 print(f"Watchdog: {stops} stops, {lows} low-memory warnings | finished jobs: {jobs}")
-print(f"Job memory: max peak {max_peak} MB | {hits} jobs hit the memory limit")
+print(f"Job memory: max peak {max(normal, default=0)} MB"
+      + (f", full runs {max(excl, default=0)} MB" if excl_match else "")
+      + f" | {hits[False] + hits[True]} jobs hit the memory limit")
+for note in notes:
+    print("Note: " + note)
 if not sugg:
     print(f"The limits fit the last {hours:g} hours. No change.")
     sys.exit(0)
