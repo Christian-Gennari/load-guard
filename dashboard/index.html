@@ -815,7 +815,7 @@ function render(s) {
   const first = !last; last = s; limits = s.limits;
   const L = s.limits, lg = s.lg, free = s.mem.free / GB;
   $('host').textContent = s.host; $('host').hidden = false;
-  const runners = lg ? lg.runners : 0, heavy = s.jobs.length, nw = s.workers.filter(w => !w.stale).length;
+  const runners = lg ? lg.runners : 0, heavy = s.jobs.reduce((n, j) => n + String(j.slot).split('+').length, 0), nw = s.workers.filter(w => !w.stale).length;
   const qh = s.queue.filter(q => q.kind === 'heavy'), qw = s.queue.filter(q => q.kind === 'worker');
 
   /* alert */
@@ -860,13 +860,15 @@ function render(s) {
 
   /* slots */
   const slots = $('slots'); slots.replaceChildren();
-  const bySlot = {}; for (const j of s.jobs) bySlot[j.slot] = j;
-  const ids = []; for (let i = 1; i <= L.max_heavy; i++) ids.push(String(i)); for (const j of s.jobs) if (!ids.includes(j.slot)) ids.push(j.slot);
+  // A job with a large memory limit takes several slots (slot "1+2"): one card for all of them.
+  const bySlot = {}, taken = new Set(); for (const j of s.jobs) { bySlot[j.slot] = j; j.slot.split('+').forEach(x => taken.add(x)); }
+  const ids = []; for (let i = 1; i <= L.max_heavy; i++) if (!taken.has(String(i))) ids.push(String(i)); for (const j of s.jobs) ids.push(j.slot);
+  ids.sort((a, b) => parseInt(a) - parseInt(b));
   for (const id of ids) {
     const j = bySlot[id];
     if (!j) { const f = el('div', 'slot free'); f.append(el('div', '', 'Slot ' + id + ' is free'), el('div', 'meta', slotsFree ? 'A heavy job can start here.' : 'A new job waits until the limits permit it.')); slots.append(f); continue; }
     const c = el('div', 'slot'), top = el('div', 'slot-top'), cmd = el('div', 'cmd', j.cmd); cmd.title = j.cmd;
-    top.append(el('b', '', 'Slot ' + id), el('span', 'num', j.started ? 'Running for ' + dur(s.t - j.started) : 'Running'));
+    top.append(el('b', '', (id.includes('+') ? 'Slots ' + id.replace(/\+/g, ' and ') : 'Slot ' + id)), el('span', 'num', j.started ? 'Running for ' + dur(s.t - j.started) : 'Running'));
     const meta = el('div', 'meta', shortPath(j.cwd) + (j.cores != null ? ' · ' + j.cores.toFixed(1) + ' of ' + parseFloat(j.cpu) / 100 + ' cores' : '')); meta.title = j.cwd;
     c.append(top, cmd, meta);
     if (j.mem_now != null && j.mem_limit) {

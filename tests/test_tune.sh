@@ -45,12 +45,11 @@ write_metrics() {  # count min-free heavy workers runners
   done
 }
 
-write_jobs() {  # count peak-mb rc
-  local n=$1 peak=$2 rc=$3 ts i
+write_jobs() {  # count peak-mb rc [cmd] — appends; reset_state empties the log
+  local n=$1 peak=$2 rc=$3 cmd=${4:-test} ts i
   ts=$(date '+%F %T')
-  : >"$state/events.log"
   for ((i = 1; i <= n; i++)); do
-    printf '%s end lg-1000-%s rc=%s dur=10s peak=%sMB cmd=test\n' "$ts" "$i" "$rc" "$peak" >>"$state/events.log"
+    printf '%s end lg-1000-%s rc=%s dur=10s peak=%sMB cmd=%s\n' "$ts" "$i" "$rc" "$peak" "$cmd" >>"$state/events.log"
   done
 }
 
@@ -88,14 +87,63 @@ grep -qx '# keep this line' "$LG_CONF" || fail "apply lost the comment line"
 grep -q 'config LG_MAX_HEAVY' "$state/events.log" || fail "missing the LG_MAX_HEAVY event: $(cat "$state/events.log")"
 grep -q 'config LG_JOB_MEM' "$state/events.log" || fail "missing the LG_JOB_MEM event: $(cat "$state/events.log")"
 
-# 5. plenty of free memory with 2 heavy jobs: one more worker
+# 5. plenty of free memory with 2 heavy jobs of 3 slots: one more worker
 reset_state
-printf 'LG_MAX_WORKERS=3\n' >"$LG_CONF"
+printf 'LG_MAX_WORKERS=3\nLG_MAX_HEAVY=3\n' >"$LG_CONF"
 write_metrics 120 8 2 3 0
 : >"$state/events.log"
-out=$("$lg" tune)
+out=$(LG_TEST_RAM_GB=32 LG_TEST_CORES=12 "$lg" tune)
 [[ $(row LG_MAX_WORKERS "$out") == "3 4" ]] || fail "expected LG_MAX_WORKERS 3 -> 4, got: $out"
 [[ $(grep -c '^LG_' <<<"$out") == 1 ]] || fail "expected only the worker suggestion, got: $out"
+
+# 7. every heavy slot often in use while memory sat free: one more slot, up to cores / 4,
+#    and the memory per job shrinks so that 3 slots still leave LG_MIN_FREE_GB free
+export LG_TEST_RAM_GB=15
+reset_state
+printf 'LG_MAX_HEAVY=2\nLG_HEAVY_FREE_GB=4\nLG_MIN_FREE_GB=4\nLG_JOB_MEM=5G\n' >"$LG_CONF"
+write_metrics 120 8 2 3 0
+write_jobs 6 1000 0
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ $(row LG_MAX_HEAVY "$out") == "2 3" ]] || fail "expected LG_MAX_HEAVY 2 -> 3, got: $out"
+[[ $(row LG_JOB_MEM "$out") == "5G 1.5G" ]] || fail "expected LG_JOB_MEM 5G -> 1.5G, got: $out"
+[[ $(grep -c '^LG_' <<<"$out") == 2 ]] || fail "expected the slot and memory suggestions only, got: $out"
+reset_state
+write_metrics 120 8 2 3 0
+write_jobs 6 3000 0  # most jobs need 4G (3000 MB + 30 %), but 3 slots give 3.5G each: no third slot
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ -z $(row LG_MAX_HEAVY "$out") ]] || fail "jobs too big for a third slot: expected no slot change, got: $out"
+grep -q 'would give each job only 3.5G' <<<"$out" || fail "expected a note on the slot share, got: $out"
+reset_state
+write_metrics 120 8 2 3 0
+out=$(LG_TEST_CORES=8 "$lg" tune)  # 8 cores: 2 slots is the cap
+[[ -z $(row LG_MAX_HEAVY "$out") ]] || fail "8 cores: expected no slot change at the 2-slot cap, got: $out"
+printf 'LG_MAX_HEAVY=2\nLG_HEAVY_FREE_GB=7\n' >"$LG_CONF"  # 8 GB free is not 2 GB above the start floor
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ -z $(row LG_MAX_HEAVY "$out") ]] || fail "too little room above LG_HEAVY_FREE_GB: expected no slot change, got: $out"
+
+# 8. the suggestions fit together: 3 slots x LG_JOB_MEM within RAM - LG_MIN_FREE_GB, and a full
+#    test suite (LG_EXCLUSIVE_MATCH) gets its own larger limit that takes several slots
+reset_state
+cat >"$LG_CONF" <<'EOF'
+LG_MAX_HEAVY=3
+LG_MIN_FREE_GB=4
+LG_JOB_MEM=5G
+LG_EXCLUSIVE_MATCH='*dotnet test*'
+LG_EXCLUSIVE_UNLESS='*--filter*'
+EOF
+write_metrics 120 6 1 3 0
+write_jobs 10 4096 0 'npm test'
+write_jobs 3 4346 0 'dotnet test App.Tests.csproj'
+write_jobs 3 1000 0 'dotnet test App.Tests.csproj --filter Foo'
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ $(row LG_JOB_MEM "$out") == "5G 3.5G" ]] || fail "expected LG_JOB_MEM 5G -> 3.5G (11 GB / 3 slots), got: $out"
+[[ $(row LG_EXCLUSIVE_MEM "$out") == "5G 6G" ]] || fail "expected LG_EXCLUSIVE_MEM 5G -> 6G, got: $out"
+grep -q 'takes 2 of 3 slots' <<<"$out" || fail "expected 'takes 2 of 3 slots', got: $out"
+grep -q '^Note: 10 of 13 jobs peaked near or above 3.5G' <<<"$out" || fail "expected a note on big jobs, got: $out"
+"$lg" tune --apply >/dev/null
+out=$(LG_TEST_CORES=12 "$lg" tune)  # applied once: the plan is stable
+grep -q 'No change' <<<"$out" || fail "second tune after --apply: expected no change, got: $out"
+unset LG_TEST_RAM_GB
 
 # 6. an invalid value: exit 2 and the file is byte-identical
 cp "$LG_CONF" "$tmp/before6.conf"

@@ -45,14 +45,14 @@ python3 "$root/dashboard/server.py" --port 18377 --bind 127.0.0.1 >"$tmp/server.
 srv=$!
 wait_for http://127.0.0.1:18377/api/settings
 
-# 1. GET: writable, token, 13 items, LG_MAX_WORKERS overridden
+# 1. GET: writable, token, 14 items, LG_MAX_WORKERS overridden
 curl -fsS http://127.0.0.1:18377/api/settings >"$tmp/settings.json"
 python3 - "$tmp/settings.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["writable"] is True, d["writable"]
 assert isinstance(d["token"], str) and d["token"], d["token"]
-assert len(d["items"]) == 13, len(d["items"])
+assert len(d["items"]) == 14, len(d["items"])
 by = {i["key"]: i for i in d["items"]}
 assert by["LG_MAX_WORKERS"]["overridden"] is True, by["LG_MAX_WORKERS"]
 assert by["LG_MAX_WORKERS"]["value"] == "3", by["LG_MAX_WORKERS"]
@@ -147,7 +147,7 @@ d = json.load(open(sys.argv[1]))
 assert d["writable"] is False, d["writable"]
 assert d["token"] is None, d["token"]
 assert "Demo data" in d["why_readonly"], d["why_readonly"]
-assert len(d["items"]) == 13, len(d["items"])
+assert len(d["items"]) == 14, len(d["items"])
 PY
 code=$(curl -sS -o "$tmp/post.json" -w '%{http_code}' -X POST http://127.0.0.1:18378/api/settings \
   -H 'Content-Type: application/json' -H 'X-LG-Token: whatever' -H 'Origin: http://127.0.0.1:18378' \
