@@ -88,14 +88,28 @@ grep -qx '# keep this line' "$LG_CONF" || fail "apply lost the comment line"
 grep -q 'config LG_MAX_HEAVY' "$state/events.log" || fail "missing the LG_MAX_HEAVY event: $(cat "$state/events.log")"
 grep -q 'config LG_JOB_MEM' "$state/events.log" || fail "missing the LG_JOB_MEM event: $(cat "$state/events.log")"
 
-# 5. plenty of free memory with 2 heavy jobs: one more worker
+# 5. plenty of free memory with 2 heavy jobs of 3 slots: one more worker
 reset_state
-printf 'LG_MAX_WORKERS=3\n' >"$LG_CONF"
+printf 'LG_MAX_WORKERS=3\nLG_MAX_HEAVY=3\n' >"$LG_CONF"
 write_metrics 120 8 2 3 0
 : >"$state/events.log"
 out=$("$lg" tune)
 [[ $(row LG_MAX_WORKERS "$out") == "3 4" ]] || fail "expected LG_MAX_WORKERS 3 -> 4, got: $out"
 [[ $(grep -c '^LG_' <<<"$out") == 1 ]] || fail "expected only the worker suggestion, got: $out"
+
+# 7. every heavy slot often in use while memory sat free: one more slot, up to cores / 4
+reset_state
+printf 'LG_MAX_HEAVY=2\nLG_HEAVY_FREE_GB=4\n' >"$LG_CONF"
+write_metrics 120 8 2 3 0
+: >"$state/events.log"
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ $(row LG_MAX_HEAVY "$out") == "2 3" ]] || fail "expected LG_MAX_HEAVY 2 -> 3, got: $out"
+[[ $(grep -c '^LG_' <<<"$out") == 1 ]] || fail "expected only the slot suggestion, got: $out"
+out=$(LG_TEST_CORES=8 "$lg" tune)  # 8 cores: 2 slots is the cap
+[[ -z $(row LG_MAX_HEAVY "$out") ]] || fail "8 cores: expected no slot change at the 2-slot cap, got: $out"
+printf 'LG_MAX_HEAVY=2\nLG_HEAVY_FREE_GB=7\n' >"$LG_CONF"  # 8 GB free is not 2 GB above the start floor
+out=$(LG_TEST_CORES=12 "$lg" tune)
+[[ -z $(row LG_MAX_HEAVY "$out") ]] || fail "too little room above LG_HEAVY_FREE_GB: expected no slot change, got: $out"
 
 # 6. an invalid value: exit 2 and the file is byte-identical
 cp "$LG_CONF" "$tmp/before6.conf"

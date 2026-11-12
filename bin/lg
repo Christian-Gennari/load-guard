@@ -336,7 +336,7 @@ cmd_tune() {  # [hours] [--apply] — suggest limits from the last N hours of me
   done
   (( 10#$h > 0 )) || { say "usage: lg tune [hours] [--apply]"; return 2; }
   local dir; dir=$(dirname "$(dirname "$(readlink -f "$0")")")/dashboard
-  LG_MIN_FREE_GB=$LG_MIN_FREE_GB python3 - "$h" "$apply" "$METRICS" "$LOG" "$CONF" "$LG_JOB_MEM" "$LG_MAX_HEAVY" "$LG_MAX_WORKERS" "$_ram_gb" "$dir" <<'PY'
+  LG_MIN_FREE_GB=$LG_MIN_FREE_GB LG_HEAVY_FREE_GB=$LG_HEAVY_FREE_GB LG_CORES=$_cores python3 - "$h" "$apply" "$METRICS" "$LOG" "$CONF" "$LG_JOB_MEM" "$LG_MAX_HEAVY" "$LG_MAX_WORKERS" "$_ram_gb" "$dir" <<'PY'
 import math, os, re, subprocess, sys, time
 
 hours = float(sys.argv[1])
@@ -361,7 +361,7 @@ def fmt_gb(v):
 
 # ---- metrics: epoch free_gb swap_gb load1 psi heavy workers runners ----
 since = time.time() - hours * 3600
-free, parallel = [], []
+free, parallel, free_full = [], [], []  # free_full: free memory while every heavy slot was taken
 try:
     with open(metrics_path, errors="replace") as f:
         for line in f:
@@ -375,6 +375,8 @@ try:
                 free.append(float(p[1]))
                 runners = int(float(p[7])) if len(p) > 7 else 0
                 parallel.append(int(float(p[5])) + runners)
+                if int(float(p[5])) >= int(max_heavy):
+                    free_full.append(float(p[1]))
             except ValueError:
                 continue
 except OSError:
@@ -447,6 +449,8 @@ elif jobs >= 5:
         sugg.append(("LG_JOB_MEM", job_mem_raw, fmt_gb(new),
                      f"jobs peaked at {max_peak} MB; with 30 % headroom that is {fmt_gb(new)}"))
 
+heavy_free = float(os.environ.get("LG_HEAVY_FREE_GB") or os.environ.get("LG_MIN_FREE_GB") or 0)
+heavy_cap = min(8, max(1, int(os.environ.get("LG_CORES") or 1) // 4))  # same core cap as the default
 low = stops > 0 or min_free < 3
 if low and int(max_heavy) > 1:
     why = []
@@ -455,6 +459,14 @@ if low and int(max_heavy) > 1:
     if min_free < 3:
         why.append(f"free memory fell to {min_free:g} GB, below 3 GB")
     sugg.append(("LG_MAX_HEAVY", str(int(max_heavy)), str(max(1, int(max_heavy) - 1)), "; ".join(why)))
+elif (not low and len(free_full) >= len(free) * 0.1 and int(max_heavy) < heavy_cap
+      and sum(free_full) / len(free_full) >= heavy_free + 2):
+    # slots were often all taken while memory sat free: one more slot. A job in it still starts only
+    # with LG_HEAVY_FREE_GB free, and the watchdog still stops the newest job when memory runs low.
+    avg = sum(free_full) / len(free_full)
+    sugg.append(("LG_MAX_HEAVY", str(int(max_heavy)), str(int(max_heavy) + 1),
+                 f"all {int(max_heavy)} slots were in use {100 * len(free_full) / len(free):.0f} % of the time "
+                 f"with {avg:.1f} GB free on average"))
 elif not low and min_free >= 5 and max_parallel >= 2 and stops == 0 and int(max_workers) < 8:
     sugg.append(("LG_MAX_WORKERS", str(int(max_workers)), str(min(8, int(max_workers) + 1)),
                  f"free memory stayed at {min_free:g} GB or more with {max_parallel} heavy jobs running"))
